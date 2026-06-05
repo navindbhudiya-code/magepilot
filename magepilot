@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Magepilot — one command for the whole stack: install, serve, and use.
+#   ./magepilot help
+set -euo pipefail
+
+# Resolve symlinks so `magepilot` works when symlinked onto PATH (e.g. ~/.local/bin/magepilot).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [ "${SOURCE#/}" = "$SOURCE" ] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+VENV="$ROOT/mlx-env"
+RUNDIR="$ROOT/.magepilot"
+LOGDIR="$ROOT/logs"
+# Prefer a locally-built model (no download) if present; else pull from HuggingFace once.
+_DEFAULT_MODEL="navindbhudiya/qwen2.5-coder-7b-magento-v2"
+[ -f "$ROOT/models/qwen2.5-coder-7b-magento-v4/config.json" ] && _DEFAULT_MODEL="$ROOT/models/qwen2.5-coder-7b-magento-v4"
+MODEL="${MAGEPILOT_MODEL:-$_DEFAULT_MODEL}"
+MODEL_PORT=8080
+RAG_PORT=8090
+
+# The directory you launched magepilot from is the project it works on
+# (used by /code, /sql, /suggest, …). Override with AGENT_CODEBASE or --root.
+export AGENT_CODEBASE="${AGENT_CODEBASE:-$PWD}"
+
+c_blue=$'\033[94m'; c_green=$'\033[92m'; c_yellow=$'\033[93m'; c_red=$'\033[91m'; c_off=$'\033[0m'
+info() { echo "${c_blue}magepilot${c_off} $*"; }
+ok()   { echo "${c_green}✓${c_off} $*"; }
+warn() { echo "${c_yellow}!${c_off} $*"; }
+die()  { echo "${c_red}✗${c_off} $*" >&2; exit 1; }
+
+need_venv() { [ -x "$VENV/bin/python" ] || die "environment missing — run: ./magepilot install"; }
+activate()  { need_venv; # shellcheck disable=SC1091
+              source "$VENV/bin/activate"; }
+up() { curl -s -m 3 "http://127.0.0.1:$1/v1/models" >/dev/null 2>&1; }
+
+# ----------------------------------------------------------------------------- install
+cmd_install() {
+  command -v uv >/dev/null 2>&1 || die "uv not found — install it first:  brew install uv"
+  [ -d "$VENV" ] || { info "creating Python environment (mlx-env)…"; uv venv "$VENV"; }
+  # shellcheck disable=SC1091
+  source "$VENV/bin/activate"
+  info "installing dependencies (mlx-lm, chromadb, prompt_toolkit)…"
+  uv pip install -q mlx-lm chromadb prompt_toolkit
+  info "building the Magento knowledge base…"
+  python "$ROOT/rag/ingest.py" >/dev/null
+  _link_to_path
+  ok "installed. Next:  magepilot serve"
+}
+
+# Symlink `magepilot` into a PATH dir so end users can run it from any project directory.
+_link_to_path() {
+  local target="" d
+  for d in "$HOME/.local/bin" /usr/local/bin /opt/homebrew/bin; do
+    case ":$PATH:" in *":$d:"*) [ -d "$d" ] && [ -w "$d" ] && { target="$d"; break; } ;; esac
+  done
+  [ -n "$target" ] || { target="$HOME/.local/bin"; mkdir -p "$target"; }
+  if ln -sf "$ROOT/magepilot" "$target/magepilot" 2>/dev/null; then
+    case ":$PATH:" in
+      *":$target:"*) ok "'magepilot' added to your PATH ($target) — open a new terminal, then run it from any project" ;;
+      *) warn "linked $target/magepilot, but it's not on PATH — add it:"
+         echo "      echo 'export PATH=\"$target:\$PATH\"' >> ~/.zshrc && exec zsh" ;;
+    esac
+  else
+    warn "couldn't symlink into $target — run with the full path, or symlink it yourself"
+  fi
+}
+
+# ----------------------------------------------------------------------------- serve / stop / status
+cmd_serve() {
+  activate; mkdir -p "$RUNDIR" "$LOGDIR"
+
+  if up "$MODEL_PORT"; then
+    ok "model server already up on :$MODEL_PORT"
+  else
+    info "starting model server on :$MODEL_PORT (first run downloads ~4 GB → logs/model.log)…"
+    nohup mlx_lm.server --model "$MODEL" --host 127.0.0.1 --port "$MODEL_PORT" \
+      --temp 0.3 --top-p 0.95 >"$LOGDIR/model.log" 2>&1 &
+    echo $! >"$RUNDIR/model.pid"
+    printf "   waiting for the model to load"
+    for _ in $(seq 1 120); do up "$MODEL_PORT" && break; printf "."; sleep 2; done
+    echo
+    up "$MODEL_PORT" && ok "model server ready on :$MODEL_PORT" \
+                     || warn "not ready yet — still loading? check logs/model.log"
+  fi
+
+  info "starting RAG proxy on :${RAG_PORT}…"
+  nohup python "$ROOT/rag/rag_server.py" >"$LOGDIR/rag.log" 2>&1 &
+  echo $! >"$RUNDIR/rag.pid"
+  sleep 2
+  up "$RAG_PORT" && ok "RAG proxy ready on :$RAG_PORT  (use this for chat)" \
+                 || warn "RAG proxy starting — check logs/rag.log"
+  echo; info "ready. Try:  ./magepilot ask \"When do I use a plugin vs a preference?\""
+}
+
+cmd_stop() {
+  for svc in model rag; do
+    pidf="$RUNDIR/$svc.pid"
+    [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null && ok "stopped $svc" || true
+    rm -f "$pidf"
+  done
+  # Sweep every lingering magepilot process the PID files missed: the model server (any
+  # magento model — covers a server started before the model path changed), the RAG proxy,
+  # and any stuck helper (a hung make/ask). Scoped so it never kills this stop script or an
+  # interactive `magepilot` REPL.
+  pkill -f "mlx_lm.server.*magento"   2>/dev/null || true
+  pkill -f "mlx_lm.server --model $MODEL" 2>/dev/null || true
+  pkill -f "rag/rag_server.py"        2>/dev/null || true
+  pkill -f "rag/ask.py"               2>/dev/null || true
+  pkill -f "agent\.cli"               2>/dev/null || true
+  ok "stopped."
+}
+
+cmd_status() {
+  up "$MODEL_PORT" && ok "model server  :$MODEL_PORT  UP" || warn "model server  :$MODEL_PORT  down"
+  up "$RAG_PORT"   && ok "RAG proxy     :$RAG_PORT  UP"   || warn "RAG proxy     :$RAG_PORT  down"
+}
+
+# ----------------------------------------------------------------------------- use
+cmd_ask()     { activate; python "$ROOT/rag/ask.py" "$@"; }
+cmd_agent()   { activate; cd "$ROOT"; python -m agent.cli "$@"; }   # index|run|suggest|watch|sql
+
+usage() {
+  cat <<EOF
+${c_blue}Magepilot${c_off} — local AI coding assistant for Magento 2 & Hyvä
+
+${c_green}Interactive${c_off}
+  ./magepilot                      start the interactive assistant (type questions, /commands)
+
+${c_green}Setup${c_off}
+  ./magepilot install              create the env, install deps, build the knowledge base
+  ./magepilot serve                start the model server (:$MODEL_PORT) + RAG proxy (:$RAG_PORT)
+  ./magepilot stop                 stop both servers
+  ./magepilot status               show what's running
+
+${c_green}Use${c_off}
+  ./magepilot ask "<question>"            ask the grounded assistant
+  ./magepilot index --root <store>        index a Magento codebase for the agent
+  ./magepilot run "<task>"                ask the agent about the indexed codebase
+  ./magepilot make "<task>"               create/edit files for a task (approve each change)
+  ./magepilot undo                        revert the files changed by the last make
+  ./magepilot suggest --root <store>      propose & run the Magento commands your changes need
+  ./magepilot watch --root <store>        keep proposing commands as you edit files
+  ./magepilot sql --root <store> "<SQL>"  run a read-only query against the store DB
+
+  (index/run/suggest/watch/sql forward straight to the agent CLI — all its flags work.)
+
+${c_green}Tips${c_off}
+  • Override the model:  MAGEPILOT_MODEL=<hf-id-or-path> ./magepilot serve
+  • Non-Apple hosts: set MODEL_SERVER to your own OpenAI-compatible server (see README).
+  • Put it on PATH:  ln -s "$ROOT/magepilot" /usr/local/bin/magepilot   (then just: magepilot …)
+EOF
+}
+
+# ----------------------------------------------------------------------------- dispatch
+cmd="${1:-chat}"; shift || true
+case "$cmd" in
+  chat)               activate; cd "$ROOT"; exec python -m agent.repl ;;   # interactive shell (default)
+  install)            cmd_install "$@" ;;
+  serve|start)        cmd_serve "$@" ;;
+  stop)               cmd_stop "$@" ;;
+  status)             cmd_status "$@" ;;
+  ask)                cmd_ask "$@" ;;
+  index|run|suggest|watch|sql|make|undo) cmd_agent "$cmd" "$@" ;;
+  help|-h|--help)     usage ;;
+  *)                  warn "unknown command: $cmd"; echo; usage; exit 1 ;;
+esac

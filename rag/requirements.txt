@@ -1,0 +1,3 @@
+# RAG layer dependency. HTTP uses the Python stdlib (urllib); embeddings use Chroma's
+# bundled default model (all-MiniLM-L6-v2, ONNX/CPU).
+chromadb>=0.5

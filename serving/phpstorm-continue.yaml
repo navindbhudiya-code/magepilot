@@ -1,0 +1,40 @@
+# Qwen2.5-Coder-Magento2 — PhpStorm/JetBrains config for the Continue plugin
+# ---------------------------------------------------------------------------
+# Local Magento 2 + Hyva coding assistant.
+#   - Chat        -> the RAG proxy (:8090): grounded with Magento facts + house style
+#   - Autocomplete-> the raw model (:8080): fast FIM, no retrieval overhead
+#
+# Install:
+#   1. PhpStorm > Settings > Plugins > install "Continue", restart.
+#   2. Copy this file to  ~/.continue/config.yaml
+#      (replace the autocomplete `model:` path with YOUR absolute model path —
+#       run:  curl -s localhost:8080/v1/models   to get it).
+#   3. Start the servers:
+#        bash serving/serve.sh                 # model on :8080
+#        python rag/rag_server.py              # RAG proxy on :8090
+#   4. In Continue, pick "Qwen2.5-Coder-Magento2 · Chat" in the chat dropdown.
+# ---------------------------------------------------------------------------
+name: Qwen2.5-Coder-Magento2
+version: 1.0.0
+schema: v1
+
+models:
+  # Grounded chat — retrieval-augmented (facts) + the fine-tune (style)
+  - name: Qwen2.5-Coder-Magento2 · Chat (RAG)
+    provider: openai
+    model: qwen2.5-coder-magento2                 # any name — the RAG proxy injects the real model id
+    apiBase: http://localhost:8090/v1
+    apiKey: local                    # mlx_lm.server needs no auth; Continue requires a value
+    roles:
+      - chat
+      - edit
+      - apply
+
+  # Inline autocomplete — raw fine-tune, low latency
+  - name: Qwen2.5-Coder-Magento2 · Autocomplete
+    provider: openai
+    model: REPLACE_WITH_ABSOLUTE_MODEL_PATH   # e.g. /Users/you/.../models/qwen2.5-coder-7b-magento-v2
+    apiBase: http://localhost:8080/v1
+    apiKey: local
+    roles:
+      - autocomplete

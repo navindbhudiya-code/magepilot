@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="928" height="193" viewBox="0 0 928 193" role="img" aria-label="MAGEPILOT">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d61f26"/>
+      <stop offset="0.45" stop-color="#ff5a5a"/>
+      <stop offset="1" stop-color="#ffffff"/>
+    </linearGradient>
+  </defs>
+  <rect width="928" height="193" rx="14" fill="#0d1117"/>
+  <text xml:space="preserve" font-family="ui-monospace, Menlo, 'DejaVu Sans Mono', Consolas, monospace" font-size="20" font-weight="700" fill="url(#g)">
+    <tspan x="26" y="46">███╗   ███╗ █████╗  ██████╗ ███████╗██████╗ ██╗██╗      ██████╗ ████████╗</tspan><tspan x="26" dy="23.5">████╗ ████║██╔══██╗██╔════╝ ██╔════╝██╔══██╗██║██║     ██╔═══██╗╚══██╔══╝</tspan><tspan x="26" dy="23.5">██╔████╔██║███████║██║  ███╗█████╗  ██████╔╝██║██║     ██║   ██║   ██║</tspan><tspan x="26" dy="23.5">██║╚██╔╝██║██╔══██║██║   ██║██╔══╝  ██╔═══╝ ██║██║     ██║   ██║   ██║</tspan><tspan x="26" dy="23.5">██║ ╚═╝ ██║██║  ██║╚██████╔╝███████╗██║     ██║███████╗╚██████╔╝   ██║</tspan><tspan x="26" dy="23.5">╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝     ╚═╝╚══════╝ ╚═════╝    ╚═╝</tspan>
+  </text>
+</svg>

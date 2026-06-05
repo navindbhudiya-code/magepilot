@@ -1,0 +1,84 @@
+# ── Python environment & caches ────────────────────────────────────────────
+mlx-env/
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# ── macOS ──────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Claude Code / internal instructions (private; kept locally, NOT pushed) ──
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.claude.json
+
+# ── Code-review knowledge graph (contains absolute paths / code metadata) ───
+.code-review-graph/
+
+# ── ML artifacts: large binaries, NOT for version control ──────────────────
+# LoRA / QLoRA adapters and fused models produced by mlx-lm
+adapters/
+adapter*/
+*.safetensors
+*.npz
+fused_model/
+fused-model/
+models/
+checkpoints/
+*.gguf
+
+# Hugging Face / model download caches
+.cache/
+hf_cache/
+huggingface/
+
+# ── RAG store (ChromaDB persistence) ───────────────────────────────────────
+chroma/
+chroma_db/
+.chroma/
+*.chroma
+
+# ── Local secrets / config ─────────────────────────────────────────────────
+.env
+.env.*
+*.local
+
+# ── Logs ───────────────────────────────────────────────────────────────────
+*.log
+
+# ── OPTIONAL: keep the curated dataset OUT of git ──────────────────────────
+# The dataset is fully anonymized (generic Magento patterns only), so it is
+# safe to commit and is tracked by default. If you'd rather keep it private,
+# uncomment the lines below. Note: data/_data.py holds the same content inline.
+# data/all.jsonl
+# data/train.jsonl
+# data/valid.jsonl
+# data/REPORT.md
+
+# Fused models (multi-GB, do not commit)
+qwen-magento*/
+
+# ── Post-reorg structure (already covered above; explicit for clarity) ─────
+models/
+models/qwen2.5-coder-7b-magento-v2/
+training/adapters-v1/
+training/adapters-v2/
+logs/
+rag/.chroma/
+
+# ── Magepilot agent code index — CONTAINS REAL PROPRIETARY CODE when you index a
+#    live store (chunks + embeddings + the local path in root.txt). NEVER commit. ──
+agent/.code_index/
+
+# ── Private dataset & evaluation reports (NOT committed; released separately) ──
+dataset/_data.py
+dataset/all.jsonl
+dataset/train.jsonl
+dataset/valid.jsonl
+dataset/REPORT.md
+eval/reports/
+
+# Magepilot runtime (server PIDs)
+.magepilot/

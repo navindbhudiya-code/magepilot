@@ -1,0 +1,206 @@
+"""#3 The agent loop — a ReAct controller (Reason + Act).
+
+The model is prompted to emit, each turn, either:
+
+    Thought: <reasoning>
+    Action: <tool name>
+    Action Input: <json object or plain string>
+
+…on which we run the tool and feed back `Observation: <result>`; or:
+
+    Thought: <reasoning>
+    Final Answer: <answer to the user>
+
+We stop generation at "Observation:" so the model can't hallucinate tool output, run the
+real tool, and continue. The loop is bounded by MAX_STEPS and degrades gracefully on
+malformed output (one nudge, then it returns whatever it has).
+"""
+import json
+import re
+import urllib.error
+import urllib.request
+
+from agent import config
+from agent.tools import run_tool, tool_catalog
+
+_ACTION_RE = re.compile(r"Action\s*:\s*(.+?)\s*[\r\n]+\s*Action\s*Input\s*:\s*(.*)", re.S)
+_FINAL_RE = re.compile(r"Final\s*Answer\s*:\s*(.*)", re.S)
+
+
+def _system_prompt() -> str:
+    return f"""You are Magepilot, an AI agent for Magento 2. You answer questions about a specific \
+Magento codebase by USING TOOLS to inspect it — never guess at file contents or APIs.
+
+You have these tools:
+{tool_catalog()}
+
+Work in this exact loop, one step at a time:
+
+Thought: what you need to find out next
+Action: one tool name from the list above
+Action Input: the input for that tool (a plain string, or a JSON object for read_file)
+
+After each Action you will be shown an "Observation:" with the tool's result. Use it to decide \
+the next step. When you have enough information, finish with:
+
+Thought: I now know the answer
+Final Answer: <a clear, correct answer for the developer, citing file paths and line numbers>
+
+Rules (critical):
+- NEVER answer from memory. This is a SPECIFIC codebase — any file path, class, or line you recall \
+without a tool WILL be wrong. You MUST use at least one tool before a Final Answer.
+- Output ONLY one Thought + one Action + one Action Input per step (or the Final Answer). Do not \
+write "Observation:" yourself — that is given to you.
+- Prefer search_code / find_files / grep to locate code, then read_file to confirm exact details.
+- For Magento facts/APIs you are unsure about, use kb_search before answering.
+- Cite only file paths and line numbers that appeared in an Observation. If the tools don't show \
+something, say so rather than inventing it.
+- Be efficient and decisive: as soon as an Observation shows you the answer, STOP and give the \
+Final Answer — do not keep investigating. Cite the EXACT line of the specific statement (e.g. the \
+line of the `throw`), not a whole-file range, and name the exact method it is in."""
+
+
+def _example() -> str:
+    # A one-shot exemplar keeps a 7B model on-format.
+    return (
+        "Thought: I should locate where the SKU loader lives.\n"
+        "Action: search_code\n"
+        "Action Input: load products by sku in one query\n"
+    )
+
+
+def call_model(messages: list[dict], stop: list[str]) -> str:
+    payload = {"model": _model_id(), "messages": messages, "stop": stop, **config.SAMPLING}
+    req = urllib.request.Request(
+        config.MODEL_SERVER + "/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.load(r)["choices"][0]["message"]["content"]
+
+
+def _model_id() -> str:
+    """Pick the agent's reasoning model — the base Instruct model by default (best at tools)."""
+    try:
+        with urllib.request.urlopen(config.MODEL_SERVER + "/models", timeout=5) as r:
+            ids = [m["id"] for m in json.load(r)["data"]]
+    except Exception:
+        return config.AGENT_MODEL or "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+    if config.AGENT_MODEL:
+        return next((m for m in ids if config.AGENT_MODEL in m), ids[0])
+    # auto: prefer the base Instruct model; avoid the style fine-tune for tool reasoning
+    base = next((m for m in ids if "Instruct" in m and "magento" not in m.lower()), None)
+    return base or ids[0]
+
+
+def run(task: str, root: str, max_steps: int = config.MAX_STEPS, verbose: bool = True) -> dict:
+    """Run the agent on `task` against the codebase at `root`.
+
+    Returns {"answer": str, "steps": [{thought, action, action_input, observation}], "stopped": str}.
+    """
+    scratchpad = ""
+    steps = []
+    seen_calls = set()
+    nudged = False
+    rejected_finals = 0
+    repeat_strikes = 0
+
+    for _ in range(max_steps):
+        messages = [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "user", "content": f"Question: {task}\n\nBegin.\n\n{_example() if not scratchpad else ''}{scratchpad}"},
+        ]
+        out = call_model(messages, stop=["Observation:", "<|im_end|>"]).strip()
+
+        final = _FINAL_RE.search(out)
+        if final:
+            # Refuse to accept an answer that used no tools — it is answering from (wrong) memory.
+            if not steps and rejected_finals < 2:
+                rejected_finals += 1
+                scratchpad += (
+                    "(You answered without inspecting the codebase. That answer is rejected — your "
+                    "memory of file paths/classes WILL be wrong for this specific project. Start over: "
+                    "emit an `Action:` to investigate the real code first.)\n"
+                )
+                if verbose:
+                    print("\n\033[91m[guard]\033[0m rejected a no-tool Final Answer — forcing investigation.")
+                continue
+            answer = final.group(1).strip()
+            if verbose:
+                print(f"\n\033[92mFinal Answer:\033[0m {answer}")
+            return {"answer": answer, "steps": steps, "stopped": "final"}
+
+        m = _ACTION_RE.search(out)
+        if not m:
+            if not nudged:
+                nudged = True
+                scratchpad += out + "\n(Reminder: respond with `Action:` + `Action Input:`, or `Final Answer:`.)\n"
+                continue
+            return {"answer": out.strip(), "steps": steps, "stopped": "unparsed"}
+
+        thought = out[:m.start()].replace("Thought:", "").strip()
+        action = m.group(1).strip().strip("`")
+        action_input = m.group(2).strip()
+        # Action Input may have eaten trailing text; keep only its first line/JSON.
+        action_input = _first_arg(action_input)
+
+        sig = f"{action}|{action_input}"
+        if sig in seen_calls:
+            repeat_strikes += 1
+            if repeat_strikes >= 3:
+                if verbose:
+                    print("\n\033[91m[guard]\033[0m repeated the same call 3x — synthesizing from findings.")
+                break
+            observation = ("You already ran this exact call — its result is above. Do something "
+                           "DIFFERENT: use read_file to open the full file and see the relevant lines, "
+                           "use grep for the exact symbol, or give your Final Answer now.")
+        else:
+            repeat_strikes = 0
+            seen_calls.add(sig)
+            observation = run_tool(root, action, action_input)
+        steps.append({"thought": thought, "action": action,
+                      "action_input": action_input, "observation": observation})
+        if verbose:
+            print(f"\n\033[96mThought:\033[0m {thought}")
+            print(f"\033[93mAction:\033[0m {action}  \033[93mInput:\033[0m {action_input}")
+            print(f"\033[90mObservation:\033[0m {observation[:400]}{'…' if len(observation) > 400 else ''}")
+
+        scratchpad += (f"Thought: {thought}\nAction: {action}\nAction Input: {action_input}\n"
+                       f"Observation: {observation}\n")
+
+    # Out of steps — ask the model to summarize what it found.
+    summary = _force_answer(task, scratchpad)
+    return {"answer": summary, "steps": steps, "stopped": "max_steps"}
+
+
+def _first_arg(text: str) -> str:
+    """Keep just the tool input: a leading JSON object, else the first non-empty line."""
+    text = text.strip()
+    if text.startswith("{"):
+        depth, end = 0, None
+        for i, c in enumerate(text):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end:
+            return text[:end]
+    return text.splitlines()[0].strip() if text.splitlines() else ""
+
+
+def _force_answer(task: str, scratchpad: str) -> str:
+    """Final synthesis when the step budget is exhausted."""
+    messages = [
+        {"role": "system", "content": "You are Magepilot. Using ONLY the investigation notes below, "
+                                       "give the developer a clear, correct final answer with file paths "
+                                       "and line numbers. If the notes are insufficient, say what is missing."},
+        {"role": "user", "content": f"Question: {task}\n\nInvestigation notes:\n{scratchpad}\n\nFinal Answer:"},
+    ]
+    try:
+        return call_model(messages, stop=["<|im_end|>"]).strip()
+    except (urllib.error.URLError, OSError) as e:
+        return f"(agent reached the step limit; model summary unavailable: {e})"
