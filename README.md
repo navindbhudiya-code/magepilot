@@ -24,6 +24,36 @@ your machine, like a Magento-native `claude`. **No code leaves your Mac.**
 
 ---
 
+## Install
+
+### Quick install
+
+```bash
+curl -fsSL https://navindbhudiya.com/install.sh | bash
+```
+
+That's it. The installer sets up `uv`, clones Magepilot to `~/.magepilot`, builds the Python
+environment + Magento knowledge base, and adds the `magepilot` command to your PATH. The
+~4 GB model is **not** downloaded here — that happens on your first `magepilot serve`.
+
+> **Inspect it first?** `curl -fsSL https://navindbhudiya.com/install.sh | less` prints the
+> script before you run anything. Override the location with
+> `MAGEPILOT_HOME=/path curl -fsSL https://navindbhudiya.com/install.sh | bash`.
+
+Re-running the one-liner later updates an existing install (`git pull`).
+
+### Manual install
+
+```bash
+git clone https://github.com/navindbhudiya-code/magepilot.git
+cd magepilot
+
+brew install uv             # if you don't have it
+./magepilot install         # env + deps + knowledge base, and adds `magepilot` to your PATH
+```
+
+Open a new terminal afterwards so `magepilot` is picked up. Then you can run it from any Magento project.
+
 ## What it does
 
 - 💬 **Grounded answers** — idiomatic Magento 2 + Hyvä code, with facts grounded by a knowledge base (RAG)
@@ -73,36 +103,6 @@ Only the bundled **model server** needs Apple Silicon — the **RAG layer and th
 > the **base Qwen2.5-Coder**. You keep the full **agent** (it reasons on the base model anyway) and **RAG**
 > facts; you lose only the Magento *style* fine-tune until the weights are converted to GGUF/HF format.
 > WSL2 is Linux — MLX won't run inside it, but serving via Ollama/llama.cpp + the RAG/agent works there.
-
-## Install
-
-### Quick install
-
-```bash
-curl -fsSL https://navindbhudiya.com/install.sh | bash
-```
-
-That's it. The installer sets up `uv`, clones Magepilot to `~/.magepilot`, builds the Python
-environment + Magento knowledge base, and adds the `magepilot` command to your PATH. The
-~4 GB model is **not** downloaded here — that happens on your first `magepilot serve`.
-
-> **Inspect it first?** `curl -fsSL https://navindbhudiya.com/install.sh | less` prints the
-> script before you run anything. Override the location with
-> `MAGEPILOT_HOME=/path curl -fsSL https://navindbhudiya.com/install.sh | bash`.
-
-Re-running the one-liner later updates an existing install (`git pull`).
-
-### Manual install
-
-```bash
-git clone https://github.com/navindbhudiya-code/magepilot.git
-cd magepilot
-
-brew install uv             # if you don't have it
-./magepilot install         # env + deps + knowledge base, and adds `magepilot` to your PATH
-```
-
-Open a new terminal afterwards so `magepilot` is picked up. Then you can run it from any Magento project.
 
 ## Start it
 
