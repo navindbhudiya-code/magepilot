@@ -82,3 +82,12 @@ eval/reports/
 
 # Magepilot runtime (server PIDs)
 .magepilot/
+
+# ── Marketing website (separate Vite app; built + deployed to S3 on its own) ──
+website/
+
+# ── IDE settings ────────────────────────────────────────────────────────────
+.idea/
+
+# ── Training runs (configs + adapter checkpoints; adapters released via HF) ──
+training/
