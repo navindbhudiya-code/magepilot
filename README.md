@@ -50,7 +50,8 @@ your machine, like a Magento-native `claude`. **No code leaves your Mac.**
 
 - **Apple Silicon Mac (M1–M4)** — required for the **bundled** setup (the MLX model + `mlx_lm.server`).
   MLX runs only on Apple Silicon, and the model is published in MLX format. *Other platforms: see below.*
-- **[`uv`](https://docs.astral.sh/uv/)** (Python package manager): `brew install uv`
+- **[`uv`](https://docs.astral.sh/uv/)** (Python package manager): `brew install uv` — *the
+  [quick installer](#quick-install) sets this up for you automatically.*
 - ~**5 GB** free disk (the model downloads once).
 - *Optional:* PhpStorm + the **Continue** plugin · **ripgrep** (`brew install ripgrep`) for faster search ·
   **Docker/Warden** for the agent's database debugging.
@@ -74,6 +75,24 @@ Only the bundled **model server** needs Apple Silicon — the **RAG layer and th
 > WSL2 is Linux — MLX won't run inside it, but serving via Ollama/llama.cpp + the RAG/agent works there.
 
 ## Install
+
+### Quick install
+
+```bash
+curl -fsSL https://navindbhudiya.com/install.sh | bash
+```
+
+That's it. The installer sets up `uv`, clones Magepilot to `~/.magepilot`, builds the Python
+environment + Magento knowledge base, and adds the `magepilot` command to your PATH. The
+~4 GB model is **not** downloaded here — that happens on your first `magepilot serve`.
+
+> **Inspect it first?** `curl -fsSL https://navindbhudiya.com/install.sh | less` prints the
+> script before you run anything. Override the location with
+> `MAGEPILOT_HOME=/path curl -fsSL https://navindbhudiya.com/install.sh | bash`.
+
+Re-running the one-liner later updates an existing install (`git pull`).
+
+### Manual install
 
 ```bash
 git clone https://github.com/navindbhudiya-code/magepilot.git
