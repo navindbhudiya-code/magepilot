@@ -215,4 +215,5 @@ is uploaded. The model itself was trained only on anonymized, generic Magento pa
 Built by **[Navin D. Bhudiya](https://in.linkedin.com/in/navindbhudiya)** — AI Engineer (11+ years in
 e-commerce at scale; production RAG, LLM agents, and intelligent search on AWS; AWS + Anthropic certified).
 
-Fine-tuned from **Qwen2.5-Coder-7B-Instruct**. Released under **Apache-2.0**.
+The Magepilot code is released under the **MIT License** — see [LICENSE](LICENSE). The model
+is fine-tuned from **Qwen2.5-Coder-7B-Instruct** (Apache-2.0).
