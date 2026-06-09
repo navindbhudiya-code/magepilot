@@ -35,6 +35,9 @@ need_venv() { [ -x "$VENV/bin/python" ] || die "environment missing — run: ./m
 activate()  { need_venv; # shellcheck disable=SC1091
               source "$VENV/bin/activate"; }
 up() { curl -s -m 3 "http://127.0.0.1:$1/v1/models" >/dev/null 2>&1; }
+# MLX (the bundled model server) publishes wheels for Apple Silicon only. Elsewhere we
+# skip mlx-lm and the user points the stack at their own server via MODEL_SERVER.
+is_apple_silicon() { [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; }
 
 # ----------------------------------------------------------------------------- install
 cmd_install() {
@@ -42,8 +45,15 @@ cmd_install() {
   [ -d "$VENV" ] || { info "creating Python environment (mlx-env)…"; uv venv "$VENV"; }
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
-  info "installing dependencies (mlx-lm, chromadb, prompt_toolkit)…"
-  uv pip install -q mlx-lm chromadb prompt_toolkit
+  if is_apple_silicon; then
+    info "installing dependencies (mlx-lm, chromadb, prompt_toolkit)…"
+    uv pip install -q mlx-lm chromadb prompt_toolkit
+  else
+    warn "not Apple Silicon — skipping mlx-lm (MLX is Apple-Silicon only)."
+    warn "serve a model yourself and export MODEL_SERVER (see README's Linux/Windows section)."
+    info "installing dependencies (chromadb, prompt_toolkit)…"
+    uv pip install -q chromadb prompt_toolkit
+  fi
   info "building the Magento knowledge base…"
   python "$ROOT/rag/ingest.py" >/dev/null
   _link_to_path
@@ -72,7 +82,14 @@ _link_to_path() {
 cmd_serve() {
   activate; mkdir -p "$RUNDIR" "$LOGDIR"
 
-  if up "$MODEL_PORT"; then
+  if ! is_apple_silicon; then
+    if [ -n "${MODEL_SERVER:-}" ]; then
+      ok "non-Apple host — using your MODEL_SERVER ($MODEL_SERVER) for the model"
+    else
+      warn "non-Apple host — the bundled MLX model server is unavailable (MLX is Apple-Silicon only)."
+      warn "serve a model yourself and export MODEL_SERVER (e.g. Ollama: http://localhost:11434/v1) — see README."
+    fi
+  elif up "$MODEL_PORT"; then
     ok "model server already up on :$MODEL_PORT"
   else
     info "starting model server on :$MODEL_PORT (first run downloads ~4 GB → logs/model.log)…"
