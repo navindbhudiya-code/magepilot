@@ -103,12 +103,17 @@ cmd_serve() {
                      || warn "not ready yet — still loading? check logs/model.log"
   fi
 
-  info "starting RAG proxy on :${RAG_PORT}…"
-  nohup python "$ROOT/rag/rag_server.py" >"$LOGDIR/rag.log" 2>&1 &
-  echo $! >"$RUNDIR/rag.pid"
-  sleep 2
-  up "$RAG_PORT" && ok "RAG proxy ready on :$RAG_PORT  (use this for chat)" \
-                 || warn "RAG proxy starting — check logs/rag.log"
+  if up "$RAG_PORT"; then
+    ok "RAG proxy already up on :$RAG_PORT"
+  else
+    info "starting RAG proxy on :${RAG_PORT}…"
+    nohup python "$ROOT/rag/rag_server.py" >"$LOGDIR/rag.log" 2>&1 &
+    echo $! >"$RUNDIR/rag.pid"
+    # first start imports chromadb + the embedder (~5-10 s) — poll instead of a fixed sleep
+    for _ in $(seq 1 30); do up "$RAG_PORT" && break; sleep 0.5; done
+    up "$RAG_PORT" && ok "RAG proxy ready on :$RAG_PORT  (use this for chat)" \
+                   || warn "RAG proxy starting — check logs/rag.log"
+  fi
   echo; info "ready. Try:  ./magepilot ask \"When do I use a plugin vs a preference?\""
 }
 

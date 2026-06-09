@@ -11,6 +11,7 @@ import json
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 import config
@@ -100,8 +101,12 @@ def main() -> None:
     elif not args.no_rag and not args.quiet:
         print("(no knowledge retrieved — answering from the model alone)\n")
 
-    with _Spinner("thinking"):
-        answer = call_model(build_messages(args.question, contexts))
+    try:
+        with _Spinner("thinking"):
+            answer = call_model(build_messages(args.question, contexts))
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+        sys.exit(f"✗ can't reach the model server at {config.MODEL_SERVER} — "
+                 f"run `magepilot serve` first.\n   ({exc})")
     print(answer)
 
 

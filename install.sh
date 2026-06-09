@@ -80,8 +80,16 @@ if [ -d "$HOME_DIR/.git" ]; then
   info "updating existing install at ${HOME_DIR}…"
   git -C "$HOME_DIR" fetch --depth 1 origin "$BRANCH" -q
   git -C "$HOME_DIR" checkout -q "$BRANCH"
-  git -C "$HOME_DIR" merge --ff-only "origin/$BRANCH" -q \
-    || warn "couldn't fast-forward (local changes?) — leaving your copy as-is"
+  if ! git -C "$HOME_DIR" merge --ff-only "origin/$BRANCH" -q 2>/dev/null; then
+    # Histories diverged (e.g. upstream was rewritten). This checkout is installer-managed,
+    # so if the user hasn't edited it, snap to upstream; if they have, leave it alone.
+    if [ -z "$(git -C "$HOME_DIR" status --porcelain)" ]; then
+      git -C "$HOME_DIR" reset --hard "origin/$BRANCH" -q
+      ok "history diverged from upstream — reset to origin/$BRANCH"
+    else
+      warn "couldn't fast-forward (local changes?) — leaving your copy as-is"
+    fi
+  fi
 elif [ -e "$HOME_DIR" ]; then
   die "${HOME_DIR} exists but isn't a git checkout — move it aside or set MAGEPILOT_HOME, then re-run."
 else

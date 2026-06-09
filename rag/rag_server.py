@@ -34,6 +34,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream(self, payload: dict) -> None:
+        """Relay the model server's SSE stream to the client as tokens arrive."""
+        req = urllib.request.Request(
+            config.MODEL_SERVER + "/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            upstream = urllib.request.urlopen(req, timeout=300)
+        except Exception as exc:  # noqa: BLE001
+            self._send(502, {"error": str(exc)})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            with upstream:
+                for line in upstream:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client disconnected mid-stream
+
     def do_GET(self):  # noqa: N802
         if self.path.rstrip("/").endswith("/models"):
             self._send(200, {"object": "list", "data": [{"id": "magento-rag", "object": "model"}]})
@@ -55,11 +80,15 @@ class Handler(BaseHTTPRequestHandler):
             sys_msg = {"role": "system", "content": SYSTEM + "\n\n## Magento reference context\n" + block}
             messages = [sys_msg] + [m for m in messages if m.get("role") != "system"]
 
-        payload = {**body, "messages": messages, "model": model_id(), "stream": False}
+        want_stream = bool(body.get("stream"))
+        payload = {**body, "messages": messages, "model": model_id(), "stream": want_stream}
         payload.setdefault("stop", ["<|im_end|>"])
         for key, val in config.SAMPLING.items():
             payload.setdefault(key, val)
 
+        if want_stream:
+            self._stream(payload)
+            return
         try:
             self._send(200, forward(payload))
         except Exception as exc:  # noqa: BLE001

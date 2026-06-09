@@ -173,6 +173,52 @@ def _server_running() -> bool:
     return False
 
 
+def _ask_via_proxy(question: str) -> bool:
+    """Stream a grounded answer through the running RAG proxy (:8090).
+
+    The proxy keeps chromadb + the embedding model warm, so this skips ask.py's multi-second
+    cold start and prints tokens as they arrive. Returns False when the proxy isn't reachable
+    (or didn't produce an answer) so the caller can fall back to the ask.py subprocess."""
+    import json
+    import urllib.request
+    payload = {"model": "magento-rag", "stream": True,
+               "messages": [{"role": "user", "content": question}]}
+    req = urllib.request.Request("http://127.0.0.1:8090/v1/chat/completions",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=300)
+    except OSError:
+        return False
+    wrote = False
+    try:
+        with resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(data)["choices"][0].get("delta", {})
+                except (ValueError, KeyError, IndexError):
+                    continue
+                chunk = delta.get("content") or ""
+                if chunk:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                    wrote = True
+    except KeyboardInterrupt:
+        print(f"\n{Y}(interrupted){X}")
+        return True
+    except OSError:
+        pass                       # stream dropped — whatever printed stands
+    if wrote:
+        print()
+    return wrote
+
+
 def _stop_servers_on_exit() -> None:
     """Stop the model + RAG servers when the REPL ends — on /exit, Ctrl-D, Ctrl-C, or a
     SIGTERM/SIGHUP (closed terminal) — so they don't linger in the background eating RAM
@@ -237,8 +283,10 @@ def main() -> int:
                 if _need_root(state):
                     print(f"{Y}(creating files — you'll approve each change; Ctrl-C to cancel){X}")
                     sh([PY, "-m", "agent.cli", "make", "--root", state["root"], line])
-            else:
-                sh([PY, "rag/ask.py", "--quiet", line])  # a question → grounded answer (answer only)
+            elif not _server_running():
+                print(f"{Y}servers aren't running{X} — start them with {G}/serve{X}, then ask again")
+            elif not _ask_via_proxy(line):             # fast path: stream via the warm RAG proxy
+                sh([PY, "rag/ask.py", "--quiet", line])  # fallback: direct (proxy down / no answer)
             continue
 
         parts = line[1:].split(maxsplit=1)
