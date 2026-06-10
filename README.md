@@ -11,8 +11,9 @@
   <a href="https://huggingface.co/navindbhudiya/qwen2.5-coder-7b-magento-v2"><img alt="model" src="https://img.shields.io/badge/%F0%9F%A4%97%20model-Qwen2.5--Coder--Magento-yellow"></a>
   <img alt="platform" src="https://img.shields.io/badge/Apple%20Silicon-MLX-black?logo=apple&logoColor=white">
   <img alt="stack" src="https://img.shields.io/badge/Magento%202-Hyv%C3%A4-f46f25">
-  <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-3fb950">
-  <a href="https://in.linkedin.com/in/navindbhudiya"><img alt="built by" src="https://img.shields.io/badge/built%20by-Navin%20D.%20Bhudiya-8957e5"></a>
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-3fb950"></a>
+  <a href="https://huggingface.co/navindbhudiya/qwen2.5-coder-7b-magento-v2"><img alt="model license" src="https://img.shields.io/badge/model%20license-Apache--2.0-blue"></a>
+  <a href="https://navindbhudiya.com/"><img alt="built by" src="https://img.shields.io/badge/built%20by-Navin%20D.%20Bhudiya-8957e5"></a>
 </p>
 
 ---
@@ -212,7 +213,7 @@ is uploaded. The model itself was trained only on anonymized, generic Magento pa
 
 ## Author & license
 
-Built by **[Navin D. Bhudiya](https://in.linkedin.com/in/navindbhudiya)** — AI Engineer (11+ years in
+Built by **[Navin D. Bhudiya](https://navindbhudiya.com/)** — AI Engineer (11+ years in
 e-commerce at scale; production RAG, LLM agents, and intelligent search on AWS; AWS + Anthropic certified).
 
 The Magepilot code is released under the **MIT License** — see [LICENSE](LICENSE). The model
