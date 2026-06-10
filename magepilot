@@ -45,14 +45,18 @@ cmd_install() {
   [ -d "$VENV" ] || { info "creating Python environment (mlx-env)…"; uv venv "$VENV"; }
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
+  # 'protobuf<7' is REQUIRED: mlx-lm pulls protobuf 7.x, which makes the resolver drop
+  # chromadb's opentelemetry exporter back to 1.11.1, whose generated _pb2 files crash on
+  # import under protobuf 7 ("Descriptors cannot be created directly"). Capping protobuf at
+  # <7 keeps protobuf 6.x + a modern (1.42.x) otel stack, so chromadb imports cleanly.
   if is_apple_silicon; then
     info "installing dependencies (mlx-lm, chromadb, prompt_toolkit)…"
-    uv pip install -q mlx-lm chromadb prompt_toolkit
+    uv pip install -q mlx-lm chromadb prompt_toolkit 'protobuf<7'
   else
     warn "not Apple Silicon — skipping mlx-lm (MLX is Apple-Silicon only)."
     warn "serve a model yourself and export MODEL_SERVER (see README's Linux/Windows section)."
     info "installing dependencies (chromadb, prompt_toolkit)…"
-    uv pip install -q chromadb prompt_toolkit
+    uv pip install -q chromadb prompt_toolkit 'protobuf<7'
   fi
   info "building the Magento knowledge base…"
   python "$ROOT/rag/ingest.py" >/dev/null
@@ -81,6 +85,12 @@ _link_to_path() {
 # ----------------------------------------------------------------------------- serve / stop / status
 cmd_serve() {
   activate; mkdir -p "$RUNDIR" "$LOGDIR"
+
+  # First-run model pull: default to plain-HTTPS downloads. HuggingFace's Xet transfer
+  # (hf_xet) can hang indefinitely mid-download on some networks with no timeout, which
+  # strands the very first `serve` at a few MB. Plain HTTPS is reliable; override by
+  # exporting HF_HUB_DISABLE_XET=0 if you want Xet's dedup back.
+  export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 
   if ! is_apple_silicon; then
     if [ -n "${MODEL_SERVER:-}" ]; then
