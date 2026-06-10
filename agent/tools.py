@@ -207,7 +207,9 @@ def kb_search(root: str, query: str, k: int = config.TOP_K_KB) -> str:
     metas = res.get("metadatas", [[]])[0]
     if not docs:
         return f"no knowledge found for '{query}'"
-    blocks = [f"--- {m.get('title', m.get('source'))}\n{d}" for d, m in zip(docs, metas)]
+    # Never expose the knowledge-base filename (private datasource): label by title only,
+    # falling back to a generic heading rather than the .md source.
+    blocks = [f"--- {m.get('title') or 'Magento reference'}\n{d}" for d, m in zip(docs, metas)]
     return _clip("\n\n".join(blocks))
 
 

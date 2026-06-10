@@ -89,17 +89,20 @@ def main() -> None:
     ap.add_argument("--no-rag", action="store_true", help="skip retrieval (model alone)")
     ap.add_argument("-k", type=int, default=config.TOP_K, help="number of chunks to retrieve")
     ap.add_argument("-q", "--quiet", action="store_true",
-                    help="print only the answer (hide the retrieved-context listing)")
+                    help="print only the answer (kept for compatibility; this is the default)")
+    ap.add_argument("--show-sources", action="store_true",
+                    help="developer-only: list the retrieved knowledge chunks (source names). "
+                         "OFF by default — knowledge-base filenames are never shown to end users.")
     args = ap.parse_args()
 
     contexts = [] if args.no_rag else retrieve(args.question, args.k)
-    if contexts and not args.quiet:
+    # The knowledge base is a private datasource: never print source filenames/titles in normal
+    # output. The retrieved chunks still ground the answer; they're only listed with --show-sources.
+    if contexts and args.show_sources:
         print("Retrieved context:")
         for c in contexts:
             print(f"  - {c['source']} :: {c['title']}  (dist {c['distance']:.3f})")
         print("-" * 70)
-    elif not args.no_rag and not args.quiet:
-        print("(no knowledge retrieved — answering from the model alone)\n")
 
     try:
         with _Spinner("thinking"):
