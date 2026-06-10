@@ -11,6 +11,7 @@
     python -m agent.cli watch   --root /path/to/magento     # same, continuously, on file change
 """
 import argparse
+import os
 import sys
 import time
 
@@ -40,8 +41,21 @@ def _ask(question):
         return ""
 
 
+def _abs_root(arg_root: str | None) -> str | None:
+    """Absolutize a relative --root against the directory magepilot was launched from.
+
+    The `magepilot` wrapper cd's into its own install dir before invoking the CLI, so a
+    relative --root like "." would otherwise resolve to the install dir instead of the
+    user's project. AGENT_CODEBASE preserves the original launch directory.
+    """
+    if arg_root and not os.path.isabs(arg_root):
+        base = os.environ.get("AGENT_CODEBASE") or os.getcwd()
+        return os.path.realpath(os.path.join(base, arg_root))
+    return arg_root
+
+
 def _resolve_root(arg_root: str | None) -> str:
-    root = arg_root or config.DEFAULT_CODEBASE or indexed_root()
+    root = _abs_root(arg_root) or config.DEFAULT_CODEBASE or indexed_root()
     if not root:
         sys.exit("no codebase root. Pass --root <path> or set AGENT_CODEBASE, and run `index` first.")
     return root
@@ -128,7 +142,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     if args.cmd == "index":
-        root = args.root or config.DEFAULT_CODEBASE
+        root = _abs_root(args.root) or config.DEFAULT_CODEBASE
         if not root:
             sys.exit("index needs --root <path to Magento codebase>")
         build_index(root)
