@@ -52,6 +52,12 @@ without a tool WILL be wrong. You MUST use at least one tool before a Final Answ
 - Output ONLY one Thought + one Action + one Action Input per step (or the Final Answer). Do not \
 write "Observation:" yourself — that is given to you.
 - Prefer search_code / find_files / grep to locate code, then read_file to confirm exact details.
+- search_code only sees THIS project's indexed app/code — it does NOT see vendor/. To find a core or \
+third-party Magento class/interface (anything `Magento\\...`, or "which class implements X"), use grep \
+or find_files — they search vendor/ too. Magento writes fully-qualified names, so grep the bare symbol \
+or use `.*` (e.g. 'class .*ProductRepository' or 'implements .*ProductRepositoryInterface'), NOT \
+'implements ProductRepositoryInterface'. If search_code returns nothing useful, switch to grep; never \
+repeat the same search_code call.
 - For Magento facts/APIs you are unsure about, use kb_search before answering.
 - Cite only file paths and line numbers that appeared in an Observation. If the tools don't show \
 something, say so rather than inventing it.

@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -60,7 +61,7 @@ def _resolve_file(root: str, path: str) -> str | None:
     root_real = os.path.realpath(root)
     suffix_hits, base_hits = [], []
     for dp, dn, fn in os.walk(root_real):
-        dn[:] = [d for d in dn if d not in config.SKIP_DIRS and not d.startswith(".")]
+        dn[:] = [d for d in dn if d not in config.SEARCH_SKIP_DIRS and not d.startswith(".")]
         for name in fn:
             rel = os.path.relpath(os.path.join(dp, name), root_real).replace("\\", "/")
             if rel == norm or rel.endswith("/" + norm):
@@ -111,7 +112,7 @@ def find_files(root: str, pattern: str) -> str:
     pat = pattern.strip()
     hits = []
     for dirpath, dirnames, filenames in os.walk(_safe_path(root, ".")):
-        dirnames[:] = [d for d in dirnames if d not in config.SKIP_DIRS and not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if d not in config.SEARCH_SKIP_DIRS and not d.startswith(".")]
         for name in filenames:
             rel = os.path.relpath(os.path.join(dirpath, name), root)
             if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel, pat) or pat in rel:
@@ -129,7 +130,12 @@ def grep(root: str, pattern: str, glob: str = None) -> str:
     root_dir = _safe_path(root, ".")
     rg = shutil.which("rg")
     if rg:
-        cmd = [rg, "--line-number", "--no-heading", "--color", "never", "--max-count", "50", "-e", pattern]
+        # --no-ignore-vcs so a .gitignore'd vendor/ is still searched (that's where core Magento
+        # lives); then glob out the noisy generated dirs so we get vendor without var/pub/generated.
+        cmd = [rg, "--line-number", "--no-heading", "--color", "never", "--max-count", "50",
+               "--no-ignore-vcs", "-e", pattern]
+        for d in config.SEARCH_SKIP_DIRS:
+            cmd += ["--glob", f"!**/{d}/**"]
         if glob:
             cmd += ["--glob", glob]
         cmd.append(root_dir)
@@ -147,8 +153,10 @@ def grep(root: str, pattern: str, glob: str = None) -> str:
     except re.error as e:
         return f"invalid regex: {e}"
     results, count = [], 0
+    # vendor/ can be tens of thousands of files; bound a no-match walk so the agent never hangs.
+    deadline = time.monotonic() + 15
     for dirpath, dirnames, filenames in os.walk(root_dir):
-        dirnames[:] = [d for d in dirnames if d not in config.SKIP_DIRS and not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames if d not in config.SEARCH_SKIP_DIRS and not d.startswith(".")]
         for name in filenames:
             if glob:
                 import fnmatch
@@ -168,7 +176,7 @@ def grep(root: str, pattern: str, glob: str = None) -> str:
                                 break
             except OSError:
                 continue
-        if count >= 50:
+        if count >= 50 or time.monotonic() > deadline:
             break
     return _clip("\n".join(results)) if results else f"no matches for '{pattern}'"
 
@@ -253,13 +261,17 @@ def magento_cli(root: str, command: str) -> str:
 TOOLS = {
     "search_code": {
         "func": search_code, "primary": "query",
-        "desc": "Semantic search over the indexed codebase. Input: a natural-language query. "
-                "Best for 'where/how is X done'.",
+        "desc": "Semantic search over THIS project's indexed code (app/code only — does NOT see "
+                "vendor/). Input: a natural-language query. Best for 'where/how is X done' in the "
+                "project's own modules.",
     },
     "grep": {
         "func": grep, "primary": "pattern",
-        "desc": "Exact/regex text search for a symbol or string across files. "
-                "Input: a regex (e.g. 'class .*Repository' or 'NoSuchEntityException').",
+        "desc": "Exact/regex text search across ALL files, INCLUDING vendor/ (core & third-party "
+                "Magento). Input: a regex. Magento code uses fully-qualified names, so match the "
+                "bare symbol rather than assuming words are adjacent: to find an implementer use "
+                "'class .*ProductRepository' or 'implements .*ProductRepositoryInterface' (the .* "
+                "spans the `\\Magento\\Catalog\\Api\\` prefix) — NOT 'implements ProductRepositoryInterface'.",
     },
     "read_file": {
         "func": read_file, "primary": "path",
@@ -268,7 +280,8 @@ TOOLS = {
     },
     "find_files": {
         "func": find_files, "primary": "pattern",
-        "desc": "Find files by name/glob. Input: a glob like 'di.xml' or '*Repository.php'.",
+        "desc": "Find files by name/glob across the whole project, INCLUDING vendor/. "
+                "Input: a glob like 'di.xml' or '*Repository.php'.",
     },
     "list_dir": {
         "func": list_dir, "primary": "path",

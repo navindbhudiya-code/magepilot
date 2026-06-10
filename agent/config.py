@@ -39,6 +39,11 @@ SKIP_DIRS = {
     "vendor", "node_modules", "generated", "var", "pub", ".git", ".idea",
     "dev", "setup", ".github", "tests", "Test", "test", "__pycache__",
 }
+# On-demand search (grep / find_files / read_file resolution) MAY descend into vendor/ — that is
+# where core & third-party Magento classes live, so symbol lookups ("which class implements X")
+# need it. The INDEXER keeps using SKIP_DIRS (embedding all of vendor would be tens of thousands
+# of files); only interactive search reaches vendor, and it still skips the noisy generated dirs.
+SEARCH_SKIP_DIRS = SKIP_DIRS - {"vendor"}
 MAX_FILE_BYTES = 512 * 1024     # skip files larger than this
 CHUNK_LINES = 48                # lines per code chunk
 CHUNK_OVERLAP = 8               # overlap between consecutive chunks
