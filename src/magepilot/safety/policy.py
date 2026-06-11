@@ -60,6 +60,8 @@ def classify(command: str) -> str:
     if cmd.startswith("composer "):
         parts = cmd.split()
         return "ask" if len(parts) > 1 and parts[1] in COMPOSER_ASK else "blocked"
+    if cmd.split(" ", 1)[0] == "vendor/bin/phpunit":
+        return "ask"            # the project's own test runner — state-safe but slow
     sub = cmd.split(" ", 1)[0]
     if sub in AUTO:
         return "auto"
@@ -75,6 +77,11 @@ def _argv(root: str, cmd: str):
         if not composer:
             return None, "composer not found on PATH"
         return [composer, *cmd.split()[1:]], None
+    if cmd.split(" ", 1)[0] == "vendor/bin/phpunit":
+        phpunit = os.path.join(os.path.realpath(root), "vendor", "bin", "phpunit")
+        if not os.path.isfile(phpunit):
+            return None, "vendor/bin/phpunit not found — run composer install first"
+        return ["php", phpunit, *cmd.split()[1:]], None
     bin_magento = os.path.join(os.path.realpath(root), "bin", "magento")
     if not os.path.isfile(bin_magento):
         return None, "bin/magento not found under the codebase root"

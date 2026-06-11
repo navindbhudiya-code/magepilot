@@ -7,8 +7,8 @@ callers and tests keep working unchanged.
 from magepilot.safety.sandbox import _resolve_file, _safe_path          # noqa: F401 (v1 re-export)
 from magepilot.graph import tool as _graphtool
 from magepilot.tools import (
-    debugtools as _debug, fs as _fs, gitops as _git, kb as _kb, magento as _magento,
-    memorytools as _memory, sql as _sql, write as _write,
+    debugtools as _debug, fs as _fs, gitops as _git, hybridsearch as _hybrid,
+    kb as _kb, magento as _magento, memorytools as _memory, sql as _sql, write as _write,
 )
 from magepilot.tools.base import (                                       # noqa: F401
     Param, RiskLevel, Tool, ToolContext, ToolError, clip as _clip, root_tool,
@@ -20,13 +20,13 @@ from magepilot.tools.parsing import _first_arg, _parse_args              # noqa:
 from magepilot.tools.registry import REGISTRY, ToolRegistry              # noqa: F401
 from magepilot.tools.sql import sql_query                                # noqa: F401
 
-for _mod in (_fs, _kb, _magento, _sql, _write, _graphtool, _memory, _git, _debug):
+for _mod in (_fs, _kb, _magento, _sql, _write, _graphtool, _memory, _git, _debug, _hybrid):
     REGISTRY.register_many(_mod.TOOLS)
 
 
-def tool_catalog() -> str:
-    """Human-readable tool list for the system prompt."""
-    return REGISTRY.catalog()
+def tool_catalog(names: tuple | None = None) -> str:
+    """Human-readable tool list for the system prompt (optionally a mode's subset)."""
+    return REGISTRY.catalog(names=names)
 
 
 def run_tool(root: str, name: str, arg: str) -> str:

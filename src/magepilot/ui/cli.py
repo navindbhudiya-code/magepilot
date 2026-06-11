@@ -147,6 +147,8 @@ def main(argv=None) -> int:
     p_do.add_argument("--root")
     p_do.add_argument("--auto-approve", action="store_true",
                       help="apply file changes and ASK-tier commands without asking")
+    p_do.add_argument("--mode", default="code",
+                      help="ask | code | architect | debug | review | refactor | test | autonomous")
     p_do.add_argument("--quiet", action="store_true")
 
     p_res = sub.add_parser("resume", help="resume a paused/interrupted run")
@@ -163,6 +165,13 @@ def main(argv=None) -> int:
 
     p_rev = sub.add_parser("review", help="review the uncommitted diff (advisory)")
     p_rev.add_argument("--root")
+
+    p_tg = sub.add_parser("testgen", help="generate a PHPUnit unit test for a class")
+    p_tg.add_argument("fqcn", help="the class FQCN, e.g. 'Vendor\\\\Faq\\\\Model\\\\FaqRepository'")
+    p_tg.add_argument("--root")
+    p_tg.add_argument("--skeleton", action="store_true",
+                      help="deterministic skeleton only — skip the model body fill")
+    p_tg.add_argument("--auto-approve", action="store_true")
 
     args = ap.parse_args(argv)
 
@@ -214,7 +223,7 @@ def main(argv=None) -> int:
 
     if args.cmd == "do":
         root = _resolve_root(args.root)
-        run = loop.start(args.objective, root)
+        run = loop.start(args.objective, root, mode=args.mode)
         print(f"run {run.run_id}" + (f"  (template: {run.template})" if run.template else ""))
         return _drive(run, auto=args.auto_approve, quiet=args.quiet)
 
@@ -247,6 +256,15 @@ def main(argv=None) -> int:
         root = _resolve_root(args.root)
         build_graph(root, vendor=not args.no_vendor)
         return 0
+
+    if args.cmd == "testgen":
+        from magepilot.testgen import write_test
+        root = _resolve_root(args.root)
+        res = write_test(root, args.fqcn, approver=_edit_approver,
+                         auto=args.auto_approve, fill=not args.skeleton)
+        if res["written"]:
+            print(f"\n\u2713 wrote {res['path']}  (run it with: vendor/bin/phpunit {res['path']})")
+        return 0 if res["written"] else 1
 
     if args.cmd == "review":
         from magepilot.review.reviewer import review_uncommitted

@@ -131,10 +131,27 @@ def _tpl_debug(objective, m):
     ]
 
 
+def _tpl_create_tests(objective, m):
+    return [
+        _t(1, "investigate", f"Identify the exact class under test for: {objective}. "
+                             f"Use `symbol` to get its FQCN, file, methods, and constructor "
+                             f"dependencies (each dependency becomes a mock).",
+           done="FQCN + constructor dependencies identified"),
+        _t(2, "edit", f"Create the PHPUnit unit test for: {objective}. Mirror the class "
+                      f"path under Test/Unit/, mock every constructor dependency in "
+                      f"setUp(), and cover the public methods (arrange/act/assert).",
+           done="test file created"),
+        _t(3, "command", "Run the new tests", done="exit 0",
+           command="vendor/bin/phpunit app/code"),
+    ]
+
+
 # (name, matcher, builder) — first match wins; matchers are deliberately conservative so
-# anything ambiguous falls through to the LLM planner.
-_CREATE = r"(?:create|add|generate|scaffold|build|set ?up|new|make)"
+# anything ambiguous falls through to the LLM planner. create_tests precedes
+# create_module so "create tests for the X module" plans tests, not a module.
+_CREATE = r"(?:create|add|generate|scaffold|build|set ?up|new|make|write)"
 TEMPLATES = [
+    ("create_tests", re.compile(_CREATE + r"\b.*\b(?:unit )?tests?\b", re.I), _tpl_create_tests),
     ("create_theme", re.compile(_CREATE + r"\b.*\btheme\b", re.I), _tpl_create_theme),
     ("create_module", re.compile(_CREATE + r"\b.*\bmodule\b", re.I), _tpl_create_module),
     ("add_plugin", re.compile(_CREATE + r"\b.*\bplugin\b|intercept\b", re.I), _tpl_add_plugin),
@@ -199,9 +216,17 @@ def _single_task(objective: str) -> list[Task]:
     return [Task(id=1, kind=kind, goal=objective, done_when="objective satisfied")]
 
 
-def plan(objective: str, complete=None) -> tuple[str, list[Task]]:
+NO_EDIT_MODES = ("ask", "architect", "review")
+
+
+def plan(objective: str, complete=None, mode: str = "code") -> tuple[str, list[Task]]:
     """Build the task queue. Returns (template_name_or_empty, tasks). Never raises:
-    template → LLM numbered-line fallback (one nudge) → single task."""
+    template → LLM numbered-line fallback (one nudge) → single task. No-edit modes
+    (ask/architect/review) always get a single investigate task — they never plan
+    file changes regardless of how build-ish the objective sounds."""
+    if mode in NO_EDIT_MODES:
+        return "", [Task(id=1, kind="investigate", goal=objective,
+                         done_when="question answered with citations")]
     hit = match_template(objective)
     if hit:
         return hit

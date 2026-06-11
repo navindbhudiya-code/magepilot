@@ -1,0 +1,11 @@
+type Query {
+    faq(id: Int! @doc(description: "FAQ id")): Faq
+        @resolver(class: "Vendor\\Faq\\Model\\Resolver\\Faq")
+        @doc(description: "Load one FAQ entry")
+}
+
+type Faq @doc(description: "One FAQ entry") {
+    entity_id: Int
+    question: String
+    answer: String
+}

@@ -27,12 +27,12 @@ from magepilot.tools import run_tool, tool_catalog
 from magepilot.tools.parsing import _ACTION_RE, _FINAL_RE, _first_arg  # noqa: F401 (v1 names)
 
 
-def _system_prompt() -> str:
+def _system_prompt(tools_subset: tuple | None = None) -> str:
     return f"""You are Magepilot, an AI agent for Magento 2. You answer questions about a specific \
 Magento codebase by USING TOOLS to inspect it — never guess at file contents or APIs.
 
 You have these tools:
-{tool_catalog()}
+{tool_catalog(tools_subset)}
 
 Work in this exact loop, one step at a time:
 
@@ -84,7 +84,7 @@ def call_model(messages: list[dict], stop: list[str]) -> str:
 
 def run(task: str, root: str, max_steps: int = None, verbose: bool = True, *,
         system_addendum: str = "", initial_scratchpad: str = "",
-        on_step=None, cancel=None) -> dict:
+        on_step=None, cancel=None, tools_subset: tuple | None = None) -> dict:
     """Run the agent on `task` against the codebase at `root`.
 
     Orchestrator hooks (all optional — v1 callers are unaffected):
@@ -103,7 +103,7 @@ def run(task: str, root: str, max_steps: int = None, verbose: bool = True, *,
     nudged = False
     rejected_finals = 0
     repeat_strikes = 0
-    system = _system_prompt() + (f"\n\n{system_addendum}" if system_addendum else "")
+    system = _system_prompt(tools_subset) + (f"\n\n{system_addendum}" if system_addendum else "")
 
     for _ in range(max_steps):
         if cancel is not None and cancel.is_set():

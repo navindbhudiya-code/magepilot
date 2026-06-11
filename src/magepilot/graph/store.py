@@ -63,6 +63,13 @@ class GraphStore:
             (name, path, int(in_vendor), composer, enabled))
         return self.db.execute("SELECT id FROM modules WHERE name=?", (name,)).fetchone()["id"]
 
+    def module_qname(self, module_id: int | None) -> str | None:
+        """'module:Vendor_Name' for a module row id (None-safe)."""
+        if module_id is None:
+            return None
+        row = self.db.execute("SELECT name FROM modules WHERE id=?", (module_id,)).fetchone()
+        return ("module:" + row["name"]) if row else None
+
     def module_for_path(self, path: str) -> int | None:
         """Longest-prefix module match for a file path."""
         row = self.db.execute(

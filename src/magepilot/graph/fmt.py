@@ -107,6 +107,74 @@ def impact(report: dict, note: str = "") -> str:
     return _clip("\n".join(lines))
 
 
+def route(info: dict | None, asked: str, note: str = "") -> str:
+    if info is None:
+        return f"no webapi route matches {asked}" + (f"\n{note}" if note else "")
+    lines = [f"route {info['route']}  ({info['declared_in']})",
+             f"service: {info['service']}"]
+    if info.get("impl"):
+        lines.append(f"implementation (via preference): {info['impl']}")
+    if info.get("resources"):
+        lines.append("ACL: " + ", ".join(info["resources"]))
+    if info.get("plugins"):
+        lines.append(f"{info['plugins']} plugin(s) intercept the implementation — "
+                     f"use `wiring` for the list")
+    if note:
+        lines.append(note)
+    return _clip("\n".join(lines))
+
+
+def gql(info: dict | None, asked: str, note: str = "") -> str:
+    if info is None:
+        return f"no GraphQL resolver found for {asked}" + (f"\n{note}" if note else "")
+    lines = [f"{info['field']} resolves via {info['resolver']}",
+             f"declared: {info['declared_in']}"]
+    if info.get("resolver_file"):
+        lines.append(f"resolver class: {info['resolver_file']}")
+    if note:
+        lines.append(note)
+    return _clip("\n".join(lines))
+
+
+def template(ctx: dict, note: str = "") -> str:
+    if not ctx["blocks"]:
+        return (f"no layout wiring renders {ctx['template']} "
+                "(theme overrides and PHP-side setTemplate are not indexed yet)"
+                + (f"\n{note}" if note else ""))
+    lines = [f"{ctx['template']} is rendered by {len(ctx['blocks'])} block wiring(s):"]
+    for b in ctx["blocks"]:
+        lines.append(f"- {b['block']}  handle={b['handle']} [{b['area']}]  {b['declared_in']}")
+    if ctx["view_models"]:
+        lines.append("view models passed in:")
+        lines += [f"- {v['class']}  (argument '{v['arg']}')" for v in ctx["view_models"]]
+    if note:
+        lines.append(note)
+    return _clip("\n".join(lines))
+
+
+def table(info: dict | None, asked: str, note: str = "") -> str:
+    if info is None:
+        return f"table '{asked}' is not in the graph (no db_schema.xml declares it)" \
+               + (f"\n{note}" if note else "")
+    lines = [f"table {info['table']}  engine={info['engine']}  "
+             f"{info['n_columns']} column(s)"
+             + (f"  owner={info['owner']}" if info["owner"] else "")]
+    if info["columns"]:
+        lines.append("columns: " + ", ".join(info["columns"][:24])
+                     + (" …" if info["n_columns"] > 24 else ""))
+    if info.get("extended_by"):
+        lines.append("extended by: " + ", ".join(info["extended_by"]))
+    if info["fks_out"]:
+        lines.append("references: " + ", ".join(f"{t} (via {c})" for t, c in info["fks_out"]))
+    if info["fks_in"]:
+        lines.append("referenced by: " + ", ".join(info["fks_in"]))
+    if info["used_by"]:
+        lines.append("used by: " + ", ".join(info["used_by"]))
+    if note:
+        lines.append(note)
+    return _clip("\n".join(lines))
+
+
 def diagnosis(report: dict, note: str = "") -> str:
     lines = [f"diagnosis for plugin {report['plugin']}:"]
     if report["declarations"]:
