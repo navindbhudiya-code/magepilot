@@ -67,11 +67,14 @@ line of the `throw`), not a whole-file range, and name the exact method it is in
 
 
 def _example() -> str:
-    # A one-shot exemplar keeps a 7B model on-format.
+    # A one-shot exemplar keeps a 7B model on-format. Labeled explicitly so the model
+    # doesn't execute the example call as its own first step (it did, before Phase 4).
     return (
-        "Thought: I should locate where the SKU loader lives.\n"
+        "(Format example only — this is NOT your task, choose your own first action:\n"
+        "Thought: I should locate where the relevant code lives.\n"
         "Action: search_code\n"
-        "Action Input: load products by sku in one query\n"
+        "Action Input: <your own search terms>\n"
+        ")\n"
     )
 
 

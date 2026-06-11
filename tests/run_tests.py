@@ -1173,6 +1173,196 @@ def _():
     assert_true(reviewer.review_diff("") == [], "empty diff → no issues, no model call")
 
 
+# ================================================================== Phase 4: git + debug
+import subprocess as _sp                                              # noqa: E402
+
+from magepilot.debug import stacktrace as dbg                         # noqa: E402
+
+# A realistic DI-compilation failure (the acceptance trace).
+DI_TRACE = """PHP Fatal error:  Uncaught ReflectionException: Class "Vendor\\Faq\\Plugin\\Missing" does not exist in /var/www/html/vendor/magento/framework/Code/Reader/ClassReader.php:33
+Stack trace:
+#0 /var/www/html/vendor/magento/framework/Code/Reader/ClassReader.php(33): ReflectionClass->__construct('Vendor\\\\Faq\\\\Plug...')
+#1 /var/www/html/vendor/magento/framework/ObjectManager/Definition/Runtime.php(54): Magento\\Framework\\Code\\Reader\\ClassReader->getConstructor('Vendor\\\\Faq\\\\Plug...')
+#2 /var/www/html/app/code/Vendor/Faq/Model/FaqManager.php(22): Magento\\Framework\\ObjectManager\\Definition\\Runtime->getParameters('Vendor\\\\Faq\\\\Plug...')
+#3 {main}
+  thrown in /var/www/html/vendor/magento/framework/Code/Reader/ClassReader.php on line 33"""
+
+
+def _make_repo(d: str) -> None:
+    for args in (["init", "-q", "-b", "main"],
+                 ["config", "user.email", "test@example.test"],
+                 ["config", "user.name", "Test"]):
+        _sp.run(["git", "-C", d, *args], capture_output=True, check=True)
+
+
+@test("git READ tools: status, log, diff, blame on a real temp repo")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-git-")
+    _make_repo(d)
+    open(os.path.join(d, "a.php"), "w").write("<?php\n$a = 1;\n")
+    _sp.run(["git", "-C", d, "add", "."], capture_output=True)
+    _sp.run(["git", "-C", d, "commit", "-qm", "first commit"], capture_output=True)
+    open(os.path.join(d, "a.php"), "a").write("$b = 2;\n")
+    assert_in("main", tools.run_tool(d, "git_status", ""))
+    assert_in("a.php", tools.run_tool(d, "git_status", ""))
+    assert_in("first commit", tools.run_tool(d, "git_log", ""))
+    assert_in("+$b = 2;", tools.run_tool(d, "git_diff", "a.php"))
+    assert_in("Test", tools.run_tool(d, "git_blame", '{"path": "a.php", "start": 2, "end": 2}'))
+    assert_raises(tools.ToolError, __import__("magepilot.tools.gitops", fromlist=["git_blame"])
+                  .git_blame, d, "../outside.php")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("git MUTATE tools are approval-gated; branch/add/commit work end-to-end; no push exists")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-gitw-")
+    _make_repo(d)
+    open(os.path.join(d, "x.php"), "w").write("<?php\n")
+    out = tools.REGISTRY.dispatch(ToolContext(root=d), "git_commit", "no approver")
+    assert_in("requires approval", out)
+    ctx = ToolContext(root=d, approver=lambda t, a: "yes")
+    assert_in("feature/faq", tools.REGISTRY.dispatch(
+        ctx, "git_branch", "feature/faq").lower().replace("switched to a new branch 'feature/faq'", "feature/faq"))
+    assert_in("staged", tools.REGISTRY.dispatch(ctx, "git_add", "x.php"))
+    out = tools.REGISTRY.dispatch(ctx, "git_commit", "add x")
+    assert_in("add x", out)
+    log = tools.run_tool(d, "git_log", "")
+    assert_in("add x", log)
+    # branch-name injection refused; push doesn't exist at all
+    out = tools.REGISTRY.dispatch(ctx, "git_branch", "bad name; rm -rf /")
+    assert_in("invalid branch name", out)
+    assert_true(tools.REGISTRY.get("git_push") is None, "there must be NO push tool in v1")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("parse_trace handles #N frames, thrown-in, inline file:line, and dedupes")
+def _():
+    p = dbg.parse_trace(DI_TRACE)
+    assert_true(p["exception"] == "ReflectionException", str(p["exception"]))
+    assert_in("does not exist", p["message"])
+    files = [f["file"] for f in p["frames"]]
+    assert_true(files[0].endswith("ClassReader.php") and p["frames"][0]["line"] == 33,
+                "thrown-in site must be frame 0")
+    assert_true(len([f for f in files if f.endswith("ClassReader.php")]) == 1, "deduped")
+    assert_true(any(f.endswith("FaqManager.php") for f in files))
+    inline = dbg.parse_trace("main.CRITICAL: Error: boom in /srv/app/code/V/M/X.php:99")
+    assert_true(inline["frames"] and inline["frames"][0]["line"] == 99)
+    assert_true(dbg.parse_trace("nothing here")["frames"] == [])
+
+
+@test("analyze flags the app/code frame as culprit, relativizes foreign paths, hints DI")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-dbg-")
+    out = dbg.analyze(d, DI_TRACE)
+    assert_in("exception: ReflectionException", out)
+    assert_in("app/code/Vendor/Faq/Model/FaqManager.php:22", out)
+    assert_in("most likely culprit", out)
+    culprit_line = next(ln for ln in out.splitlines() if "culprit" in ln)
+    assert_in("FaqManager", culprit_line, "the culprit must be the app/code frame, not vendor")
+    assert_in("hint:", out)
+    assert_in("symbol", out, "a does-not-exist failure must point at the graph tools")
+    assert_in("next: read_file app/code/Vendor/Faq/Model/FaqManager.php", out)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("magento_logs tails the newest entries and refuses unknown log names")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-logs-")
+    os.makedirs(os.path.join(d, "var", "log"))
+    with open(os.path.join(d, "var", "log", "exception.log"), "w") as f:
+        for i in range(1, 4):
+            f.write(f"[2026-06-1{i}T08:00:00.000000+00:00] main.CRITICAL: boom {i} "
+                    f"in /srv/app/code/V/M/X.php:{i}\nStack trace:\n#0 {{main}}\n")
+    out = tools.run_tool(d, "magento_logs", '{"log": "exception.log", "n": 2}')
+    assert_in("boom 2", out)
+    assert_in("boom 3", out)
+    assert_true("boom 1" not in out, "only the last n entries")
+    assert_in("error:", tools.run_tool(d, "magento_logs", "../../etc/passwd"))
+    assert_in("does not exist", tools.run_tool(d, "magento_logs", "system.log"))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("debug plan template routes through stack_trace / magento_logs / graph tools")
+def _():
+    name, tasks = planner.plan("fix this error: " + DI_TRACE.splitlines()[0]
+                               + "\n#0 /var/www/html/app/code/V/M/X.php(10): foo()")
+    assert_true(name == "debug")
+    assert_in("stack_trace", tasks[0].goal, "trace present → parse it first")
+    assert_in("diagnose_plugin", tasks[1].goal)
+    name2, tasks2 = planner.plan("debug why checkout is broken on the live site")
+    assert_true(name2 == "debug")
+    assert_in("magento_logs", tasks2[0].goal, "no trace → pull the logs first")
+
+
+# ---- regressions found by the Phase-4 live acceptance run
+@test("regression: a skipped no-op (delete of missing file) is NOT counted as applied")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-noop-")
+    plan = [{"op": "delete", "path": "app/code/V/M/Ghost.php"},
+            {"op": "create", "path": "app/code/V/M/Real.php", "content": "<?php\ndeclare(strict_types=1);"}]
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda t, r: plan
+    try:
+        res = edits.run_make("x", d, auto=True)
+    finally:
+        scaffold.generate_plan = orig
+    assert_true(len(res["applied"]) == 1 and res["applied"][0]["path"].endswith("Real.php"),
+                f"only the real write counts: {[o['path'] for o in res['applied']]}")
+    assert_true(any(o["path"].endswith("Ghost.php") for o in res["skipped"]))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("regression: NEEDS_REPLAN in a Final Answer is honored even when the answer parses")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-replan-")
+    plan = [run_state.Task(id=1, kind="verify", goal="confirm something impossible")]
+    run = run_state.RunState(run_id=run_state.new_run_id("replan test"),
+                             objective="replan test", root=d, plan=plan)
+    run_state.save(run)
+    orig_react, orig_replan, orig_router = loop.react.run, loop.planner.replan, compress.get_router
+    loop.react.run = lambda *a, **k: {"answer": "NEEDS_REPLAN: target cannot exist",
+                                      "steps": [], "stopped": "final", "scratchpad": ""}
+    loop.planner.replan = lambda *a, **k: None
+    compress.get_router = _no_model
+    try:
+        run = loop.run_loop(run, auto=True, verbose=False, limits=LimitsCfg())
+    finally:
+        loop.react.run, loop.planner.replan, compress.get_router = orig_react, orig_replan, orig_router
+    assert_true(run.status == "failed", f"NEEDS_REPLAN must never be 'done': {run.status}")
+    assert_true(run.plan[0].status == "failed", run.plan[0].status)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("regression: the ReAct format example is labeled, not an executable first step")
+def _():
+    ex = react_agent._example()
+    assert_in("Format example only", ex)
+    assert_in("NOT your task", ex)
+
+
+@test("regression: resuming a crashed run re-runs the task that was mid-flight")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-crash-")
+    open(os.path.join(d, "ok.php"), "w").write("x")
+    plan = [run_state.Task(id=1, kind="edit", goal="finished earlier", status="done", note="n"),
+            run_state.Task(id=2, kind="verify", goal="was mid-flight when the process died",
+                           status="running", attempts=1, check={"files_exist": ["ok.php"]})]
+    crashed = run_state.RunState(run_id=run_state.new_run_id("crash test"),
+                                 objective="crash test", root=d, plan=plan, status="running")
+    run_state.save(crashed)
+    orig_router = compress.get_router
+    compress.get_router = _no_model
+    try:
+        run = loop.resume(crashed.run_id)
+        assert_true(run.plan[1].status == "pending", "mid-flight task must be re-queued")
+        run = loop.run_loop(run, auto=True, verbose=False, limits=LimitsCfg())
+    finally:
+        compress.get_router = orig_router
+    assert_true(run.status == "done" and run.plan[1].status == "done",
+                f"{run.status} / {run.plan[1].status} — the interrupted task must actually run")
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def main() -> int:
     passed = failed = 0
     print(f"running {len(_results)} deterministic tests (no model)\n")

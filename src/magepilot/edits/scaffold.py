@@ -146,9 +146,13 @@ def run_make(task: str, root: str, approver=None, asker=None,
         if ok:
             try:
                 rev = _reverse_for(root, op)   # capture undo BEFORE changing anything
-                print("   ↳ " + _apply_op(root, op) + "\n")
-                applied.append(op)
-                reverses.append(rev)
+                msg = _apply_op(root, op)
+                print("   ↳ " + msg + "\n")
+                if msg.startswith(("skipped", "unknown")):
+                    skipped.append(op)         # a no-op is NOT an applied change
+                else:
+                    applied.append(op)
+                    reverses.append(rev)
             except ToolError as e:
                 print(f"   ↳ ⛔ refused: {e}\n"); skipped.append(op)
             except Exception as e:

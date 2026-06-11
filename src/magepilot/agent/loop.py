@@ -51,6 +51,10 @@ def resume(run_id: str) -> st.RunState:
     run = st.load(run_id)
     if run.status in ("paused", "running"):    # "running" = a crashed process; resumable
         run.status = "running"
+        for t in run.plan:
+            if t.status == "running":          # the task in flight when we died: re-run it
+                t.status = "pending"           # (its scratchpad is preserved for replay)
+                t.attempts = max(0, t.attempts - 1)
     st.log_event(run_id, "resume", status=run.status)
     return run
 
@@ -102,7 +106,7 @@ def run_loop(run: st.RunState, *, approver=None, asker=None, auto: bool = False,
         if skip:
             task.status = "skipped"
             _say(f"\033[93m→ skipped\033[0m {task.note.splitlines()[0] if task.note else ''}")
-        elif ok:
+        elif ok and "NEEDS_REPLAN" not in output:
             task.status = "done"
             _say(f"\033[92m✓ done\033[0m")
         elif "NEEDS_REPLAN" in output or task.attempts >= MAX_TASK_ATTEMPTS:

@@ -109,13 +109,20 @@ def _tpl_add_cron(objective, m):
 
 
 def _tpl_debug(objective, m):
+    has_trace = bool(re.search(r"#\d+\s+\S+\.php\(\d+\)|\.php(?::| on line )\d+", objective))
+    locate = (f"Run the stack_trace tool on the error below to get the parsed frames and "
+              f"the culprit file, then read_file the culprit around the cited line.\n"
+              f"Error report: {objective}" if has_trace else
+              f"Locate this error: {objective}. Start with magento_logs (exception.log) "
+              f"to pull the actual trace, then run stack_trace on it and read_file the "
+              f"culprit at the cited line.")
     return [
-        _t(1, "investigate", f"Locate the source of this error in the codebase: {objective}. "
-                             f"Find the exact file and line that raises it.",
-           done="error source located"),
+        _t(1, "investigate", locate, done="exact file:line of the cause identified"),
         _t(2, "investigate", "Identify the root cause: inspect the located code and its "
-                             "configuration (di.xml/events.xml) to explain WHY the error occurs.",
-           done="root cause explained"),
+                             "wiring — use `symbol` for the class, `wiring` for its "
+                             "plugins/preference, and `diagnose_plugin` if a plugin or "
+                             "Interceptor is involved. Explain WHY the error occurs.",
+           done="root cause explained with evidence"),
         _t(3, "edit", f"Apply the smallest correct fix for the root cause of: {objective}",
            done="fix applied"),
         _t(4, "verify", "Re-inspect the changed file to confirm the fix is in place and "
