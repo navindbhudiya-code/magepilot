@@ -106,6 +106,16 @@ def extract(store, file_id: int, abs_path: str, rel: str, area, module_id) -> No
         body = decl.child_by_field_name("body")
         if body is None:
             continue
+        in_vendor = rel.startswith("vendor/")
+        methods = []
+        prop_types: dict[str, str] = {}      # '$repo' → FQCN (from promoted ctor params)
+        parent_fqcn = next((resolve(text(t)) for clause in decl.named_children
+                            if clause.type == "base_clause"
+                            for t in clause.named_children
+                            if t.type in ("name", "qualified_name")), None)
+
+        # pass 1: collect members + the constructor's param→type map (the property map
+        # that makes $this->prop->method() calls resolvable in pass 2)
         for member in body.named_children:
             if member.type == "use_declaration":            # trait use
                 for t in member.named_children:
@@ -118,6 +128,29 @@ def extract(store, file_id: int, abs_path: str, rel: str, area, module_id) -> No
             if mname_node is None:
                 continue
             mname = text(mname_node)
+            methods.append((member, mname))
+            params = member.child_by_field_name("parameters")
+            if mname == "__construct" and params is not None:
+                for pos, p in enumerate(params.named_children):
+                    if p.type not in ("simple_parameter", "property_promotion_parameter"):
+                        continue
+                    ty = p.child_by_field_name("type")
+                    nm = p.child_by_field_name("name")
+                    if ty is None:
+                        continue
+                    tname = text(ty).lstrip("?")
+                    if "|" in tname or tname[:1].islower():    # unions/scalars aren't DI
+                        continue
+                    resolved = resolve(tname)
+                    store.add_edge("INJECTS", fqcn, resolved, file_id=file_id,
+                                   line=p.start_point[0] + 1,
+                                   attrs={"param": text(nm) if nm is not None else "",
+                                          "position": pos})
+                    if p.type == "property_promotion_parameter" and nm is not None:
+                        prop_types[text(nm).lstrip("$")] = resolved
+
+        # pass 2: method nodes + body scans
+        for member, mname in methods:
             params = member.child_by_field_name("parameters")
             ret = member.child_by_field_name("return_type")
             sig = (text(params) if params is not None else "()") + \
@@ -131,24 +164,8 @@ def extract(store, file_id: int, abs_path: str, rel: str, area, module_id) -> No
                            module_id=module_id, line_start=member.start_point[0] + 1,
                            line_end=member.end_point[0] + 1, signature=sig,
                            attrs=mattrs or None)
+            caller = f"{fqcn}::{mname}"
 
-            if mname == "__construct" and params is not None:
-                for pos, p in enumerate(params.named_children):
-                    if p.type not in ("simple_parameter", "property_promotion_parameter"):
-                        continue
-                    ty = p.child_by_field_name("type")
-                    nm = p.child_by_field_name("name")
-                    if ty is None:
-                        continue
-                    tname = text(ty).lstrip("?")
-                    if "|" in tname or tname[:1].islower():    # unions/scalars aren't DI
-                        continue
-                    store.add_edge("INJECTS", fqcn, resolve(tname), file_id=file_id,
-                                   line=p.start_point[0] + 1,
-                                   attrs={"param": text(nm) if nm is not None else "",
-                                          "position": pos})
-
-            # body scan: dispatch literals + table literals
             for call in (c for c in _walk(member) if c.type == "member_call_expression"):
                 cname_node = call.child_by_field_name("name")
                 if cname_node is None:
@@ -158,19 +175,57 @@ def extract(store, file_id: int, abs_path: str, rel: str, area, module_id) -> No
                 first = text(args.named_children[0]) if args is not None and args.named_children else ""
                 lit = _LITERAL.match(first.strip())
                 line = call.start_point[0] + 1
+                obj = call.child_by_field_name("object")
+                obj_text = text(obj) if obj is not None else ""
                 if cname == "dispatch":
-                    obj = call.child_by_field_name("object")
-                    if obj is not None and _EVENTISH.search(text(obj)):
+                    if obj is not None and _EVENTISH.search(obj_text):
                         if lit:
                             store.ensure_node("event", lit.group(1))
-                            store.add_edge("DISPATCHES", f"{fqcn}::{mname}", lit.group(1),
+                            store.add_edge("DISPATCHES", caller, lit.group(1),
                                            file_id=file_id, line=line)
                         else:
                             store.ensure_node("event", "(dynamic)")
-                            store.add_edge("DISPATCHES", f"{fqcn}::{mname}", "(dynamic)",
+                            store.add_edge("DISPATCHES", caller, "(dynamic)",
                                            file_id=file_id, line=line,
                                            attrs={"dynamic": True})
+                        continue
                 elif cname in ("getTable", "_init") and lit:
                     store.ensure_node("table", "table:" + lit.group(1))
                     store.add_edge("USES_TABLE", fqcn, "table:" + lit.group(1),
                                    file_id=file_id, line=line)
+                    continue
+                # best-effort CALLS — app/code only (vendor would add millions of edges)
+                if in_vendor or not cname[:1].isalpha():
+                    continue
+                target = None
+                if obj_text == "$this":
+                    target = f"{fqcn}::{cname}"
+                else:
+                    pm2 = re.match(r"\$this->(\w+)$", obj_text)
+                    if pm2 and pm2.group(1) in prop_types:
+                        target = f"{prop_types[pm2.group(1)]}::{cname}"
+                if target:
+                    store.add_edge("CALLS", caller, target, file_id=file_id, line=line,
+                                   attrs={"confidence": "static"})
+
+            if in_vendor:
+                continue
+            for call in (c for c in _walk(member) if c.type == "scoped_call_expression"):
+                scope = call.child_by_field_name("scope")
+                cname_node = call.child_by_field_name("name")
+                if scope is None or cname_node is None:
+                    continue
+                stext, cname = text(scope), text(cname_node)
+                if stext in ("self", "static"):
+                    target = f"{fqcn}::{cname}"
+                elif stext == "parent":
+                    if not parent_fqcn:
+                        continue
+                    target = f"{parent_fqcn}::{cname}"
+                elif stext[:1].isupper() or stext.startswith("\\"):
+                    target = f"{resolve(stext)}::{cname}"
+                else:
+                    continue
+                store.add_edge("CALLS", f"{fqcn}::{mname}", target, file_id=file_id,
+                               line=call.start_point[0] + 1,
+                               attrs={"confidence": "static"})

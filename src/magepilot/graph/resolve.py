@@ -45,7 +45,42 @@ def run(store) -> None:
                        "sort_order": decl_attrs.get("sort_order", 0),
                        "disabled": decl_attrs.get("disabled", False),
                        "target_has_method": tm in target_methods})
+    # 3) COVERS: Test\Unit mirror-path convention → covered class (recomputed)
+    db.execute("DELETE FROM edges WHERE kind='COVERS'")
+    for row in db.execute(
+            "SELECT qname, file_id FROM nodes WHERE kind='class' "
+            "AND qname LIKE '%Test\\Unit\\%' AND qname LIKE '%Test'").fetchall():
+        covered = row["qname"].replace("\\Test\\Unit\\", "\\")[:-len("Test")]
+        if db.execute("SELECT 1 FROM nodes WHERE qname=? AND kind IN "
+                      "('class','interface','trait')", (covered,)).fetchone():
+            store.add_edge("COVERS", row["qname"], covered, file_id=row["file_id"])
     db.commit()
+
+
+def module_load_order(db) -> dict[str, int]:
+    """Kahn topological order over DEPENDS_ON_MODULE (a module loads AFTER its
+    sequence dependencies). Higher index = later load = its di.xml wins ties."""
+    deps: dict[str, set] = {}
+    names = {r["name"] for r in db.execute("SELECT name FROM modules")}
+    for n in names:
+        deps[n] = set()
+    for r in db.execute("SELECT src_qname, dst_qname FROM edges "
+                        "WHERE kind='DEPENDS_ON_MODULE'"):
+        src = r["src_qname"].removeprefix("module:")
+        dst = r["dst_qname"].removeprefix("module:")
+        if src in deps:
+            deps[src].add(dst)
+    order, placed, idx = {}, set(), 0
+    while deps:
+        ready = sorted(n for n, d in deps.items() if not (d & set(deps)) - placed)
+        if not ready:                       # a cycle — place the rest deterministically
+            ready = sorted(deps)
+        for n in ready:
+            order[n] = idx
+            idx += 1
+            placed.add(n)
+            deps.pop(n)
+    return order
 
 
 def chain_of(db, fqcn: str, max_depth: int = MAX_CHAIN) -> list[str]:

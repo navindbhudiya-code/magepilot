@@ -19,12 +19,15 @@ from magepilot.graph.store import GraphStore, graph_path
 from magepilot.graph import resolve
 
 SKIP_DIRS = {".git", ".idea", ".github", "node_modules", "generated", "var", "pub",
-             "dev", "setup", "Test", "tests", "Fixture", "_files", "__pycache__"}
+             "dev", "setup", "tests", "Fixture", "_files", "__pycache__", "__MACOSX"}
+# pruned only inside vendor/: app/code Test/ dirs carry unit + MFTF coverage the graph
+# wants; vendor test trees are bulk we never query
+VENDOR_SKIP_DIRS = {"Test"}
 TXN_FILES = 200
 MAX_FILE_BYTES = 1024 * 1024
 # Bump when ANY extractor's output semantics change: existing graphs re-extract fully
 # on the next build (file hashes can't see code changes).
-EXTRACTOR_VERSION = "2"
+EXTRACTOR_VERSION = "3"
 
 
 def _sha1(path: str) -> str:
@@ -40,9 +43,10 @@ def _iter_files(root: str, vendor: bool):
     root = os.path.realpath(root)
     for dirpath, dirnames, filenames in os.walk(root):
         rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
         parts = [] if rel_dir == "." else rel_dir.split("/")
         in_vendor = parts[:1] == ["vendor"]
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
+                       and not (in_vendor and d in VENDOR_SKIP_DIRS)]
         if in_vendor:
             if not vendor:
                 dirnames[:] = []

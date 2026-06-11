@@ -1,0 +1,25 @@
+<?php
+declare(strict_types=1);
+/** @var \Magento\Framework\Escaper $escaper */
+/** @var \Magento\Framework\View\Element\Template $block */
+$viewModel = $block->getData('view_model');
+?>
+<div x-data="initFaqList()" class="faq-list">
+    <h2><?= $escaper->escapeHtml(__('Frequently Asked Questions')) ?></h2>
+</div>
+<script>
+    function initFaqList() {
+        return {
+            items: [],
+            init() {
+                window.addEventListener('private-content-loaded', (event) => {
+                    this.items = event.detail.data?.faq?.items ?? [];
+                });
+            },
+            select(id) {
+                window.dispatchEvent(new CustomEvent('faq-item-selected', {detail: {id}}));
+                this.$dispatch('faq-list-changed', {id});
+            }
+        };
+    }
+</script>

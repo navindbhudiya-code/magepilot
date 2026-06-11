@@ -37,6 +37,7 @@ def symbol(g, name: str, kind: str = None) -> str:
 
 _ROUTEISH = re.compile(r"^(GET|POST|PUT|DELETE|PATCH)?\s*/?V\d+/", re.I)
 _GQLISH = re.compile(r"^(Query|Mutation)\.\w+$")
+_JSEVENTISH = re.compile(r"^[a-z][\w]*(?:-[\w]+)+$")   # kebab-case CustomEvent names
 
 
 @_with_graph
@@ -54,6 +55,18 @@ def wiring(g, target: str, aspect: str = None, area: str = None) -> str:
         return fmt.template(queries.template_context(g, target), note)
     if aspect == "table":
         return fmt.table(queries.table_info(g, target), target, note)
+    if aspect == "callers":
+        return fmt.calls(queries.callers_of(g, target), target, "callers", note)
+    if aspect == "callees":
+        return fmt.calls(queries.callees_of(g, target), target, "callees", note)
+    if aspect == "tests":
+        return fmt.tests(queries.tests_for(g, target), target, note)
+    if aspect in ("jsevent", "js") or (aspect is None and "-" in target
+                                       and _JSEVENTISH.match(target)):
+        return fmt.js_event(queries.js_event_info(g, target), note)
+    if aspect == "alpine":
+        return fmt.alpine(queries.alpine_components(g, target if target != "*" else ""),
+                          target, note)
     if aspect in ("observers", "events") or (aspect is None and _EVENTISH.match(target)):
         obs, disp = queries.observers_of(g, target, area=area)
         return fmt.observers(obs, disp, target, note)
@@ -66,7 +79,8 @@ def wiring(g, target: str, aspect: str = None, area: str = None) -> str:
             out += "\n" + fmt.preferences(prefs, target)
         return out + (f"\n{note}" if note else "")
     return ("unknown aspect '" + aspect + "' — use plugins | preference | observers | "
-            "route | graphql | template | table")
+            "route | graphql | template | table | callers | callees | tests | "
+            "jsevent | alpine")
 
 
 @_with_graph
@@ -93,7 +107,8 @@ TOOLS = (
         params=(Param("target", required=True,
                       description="FQCN, event name, 'GET /V1/...', 'Query.field', x.phtml, or table"),
                 Param("aspect", description="plugins | preference | observers | route | "
-                                            "graphql | template | table"),
+                                            "graphql | template | table | callers | "
+                                            "callees | tests | jsevent | alpine"),
                 Param("area", description="frontend | adminhtml | webapi_rest | global")),
         description="EXACT Magento wiring facts from the config graph: plugins on a class "
                     "(sortOrder/area/disabled), the preference that rewrites it, observers of an "

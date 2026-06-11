@@ -193,20 +193,25 @@ def plugins_for(store, fqcn: str, method: str = None, area: str = None) -> list[
 
 # ------------------------------------------------------------------ 4. preference_for
 def preference_for(store, fqcn: str, area: str = None) -> list[dict]:
+    from magepilot.graph.resolve import module_load_order
     db = store.db
     fqcn = fqcn.strip().lstrip("\\")
-    rows = db.execute("SELECT e.*, f.in_vendor iv FROM edges e "
+    rows = db.execute("SELECT e.*, f.in_vendor iv, m.name mname FROM edges e "
                       "LEFT JOIN files f ON f.id=e.file_id "
+                      "LEFT JOIN modules m ON m.id=f.module_id "
                       "WHERE e.kind='PREFERS' AND e.src_qname=?", (fqcn,)).fetchall()
     prefs = [{"impl": r["dst_qname"], "area": r["area"],
               "declared_in": _loc(db, r["file_id"], r["line"]),
-              "vendor": bool(r["iv"])} for r in rows
+              "vendor": bool(r["iv"]), "module": r["mname"] or ""} for r in rows
              if area is None or r["area"] in ("global", area)]
-    # winner approximation: app/code beats vendor; later declaration beats earlier
     for p in prefs:
         p["winner"] = False
     if prefs:
-        best = sorted(prefs, key=lambda p: (p["vendor"],))[0]
+        # Magento semantics: the LAST-loaded module's di.xml wins. Load order comes
+        # from the DEPENDS_ON_MODULE topology; app/code-over-vendor breaks ties for
+        # modules with no dependency relation.
+        order = module_load_order(db) if len(prefs) > 1 else {}
+        best = max(prefs, key=lambda p: (order.get(p["module"], -1), not p["vendor"]))
         best["winner"] = True
     return prefs
 
@@ -239,16 +244,18 @@ def impact_of(store, fqcn: str) -> dict:
     fqcn = fqcn.strip().lstrip("\\")
     out = {"target": fqcn, "relations": {}}
     rels = {
-        "implementors": ("IMPLEMENTS", "dst"),
-        "subclasses": ("EXTENDS", "dst"),
-        "injectors": ("INJECTS", "dst"),
-        "plugins": ("PLUGS_INTO", "dst"),
-        "preferences": ("PREFERS", "src"),
-        "di_arguments": ("DI_ARGUMENT", "dst"),
-        "dispatches_from": ("DISPATCHES", "src"),
+        "implementors": ("IMPLEMENTS", "dst", False),
+        "subclasses": ("EXTENDS", "dst", False),
+        "injectors": ("INJECTS", "dst", False),
+        "plugins": ("PLUGS_INTO", "dst", False),
+        "preferences": ("PREFERS", "src", False),
+        "di_arguments": ("DI_ARGUMENT", "dst", False),
+        "dispatches_from": ("DISPATCHES", "src", True),
+        "callers": ("CALLS", "dst", True),     # who calls any of its methods (app/code)
+        "tests": ("COVERS", "dst", False),     # unit tests mirroring this class
     }
-    for label, (kind, col) in rels.items():
-        like = fqcn + "::%" if label == "dispatches_from" else None
+    for label, (kind, col, use_like) in rels.items():
+        like = fqcn + "::%" if use_like else None
         where = f"{col}_qname LIKE ?" if like else f"{col}_qname = ?"
         n = db.execute(f"SELECT COUNT(*) FROM edges WHERE kind=? AND {where}",
                        (kind, like or fqcn)).fetchone()[0]
@@ -393,6 +400,78 @@ def table_info(store, table: str) -> dict | None:
             "declared_in": _loc(db, owner["file_id"]) if owner else "",
             "extended_by": extended_by[:8],
             "fks_out": fks_out, "fks_in": fks_in, "used_by": users}
+
+
+# ------------------------------------------------------------------ v3: call graph
+def callers_of(store, target: str, limit: int = CAP) -> list[dict]:
+    """Who calls a method ('Class::method') or anything on a class (FQCN).
+    Best-effort static edges, app/code only."""
+    db = store.db
+    target = target.strip().lstrip("\\")
+    where, arg = ("dst_qname = ?", target) if "::" in target \
+        else ("dst_qname LIKE ?", target + "::%")
+    return [{"caller": r["src_qname"], "callee": r["dst_qname"],
+             "declared_in": _loc(db, r["file_id"], r["line"])}
+            for r in db.execute(f"SELECT * FROM edges WHERE kind='CALLS' AND {where} "
+                                f"ORDER BY src_qname LIMIT ?", (arg, limit))]
+
+
+def callees_of(store, target: str, limit: int = CAP) -> list[dict]:
+    """What a method (or every method of a class) calls — static, app/code only."""
+    db = store.db
+    target = target.strip().lstrip("\\")
+    where, arg = ("src_qname = ?", target) if "::" in target \
+        else ("src_qname LIKE ?", target + "::%")
+    return [{"caller": r["src_qname"], "callee": r["dst_qname"],
+             "declared_in": _loc(db, r["file_id"], r["line"])}
+            for r in db.execute(f"SELECT * FROM edges WHERE kind='CALLS' AND {where} "
+                                f"ORDER BY id LIMIT ?", (arg, limit))]
+
+
+# ------------------------------------------------------------------ v3: test coverage
+def tests_for(store, fqcn: str) -> list[dict]:
+    """Unit tests covering a class (COVERS edges from the Test/Unit mirror convention)
+    + MFTF tests in its module."""
+    db = store.db
+    fqcn = fqcn.strip().lstrip("\\")
+    out = [{"test": r["src_qname"], "kind": "unit",
+            "declared_in": _loc(db, r["file_id"])}
+           for r in db.execute("SELECT * FROM edges WHERE kind='COVERS' AND dst_qname=?",
+                               (fqcn,))]
+    mod = db.execute("SELECT m.name FROM nodes n JOIN modules m ON m.id=n.module_id "
+                     "WHERE n.qname=? AND n.kind IN ('class','interface')", (fqcn,)).fetchone()
+    if mod:
+        out += [{"test": r["src_qname"].removeprefix("mftf:"), "kind": "mftf",
+                 "declared_in": _loc(db, r["file_id"])}
+                for r in db.execute(
+                "SELECT * FROM edges WHERE kind='TESTS_MODULE' AND dst_qname=? LIMIT ?",
+                ("module:" + mod["name"], CAP))]
+    return out[:CAP * 2]
+
+
+# ------------------------------------------------------------------ v3: JS events / Alpine
+def js_event_info(store, name: str) -> dict:
+    """Browser-side wiring: who emits and who listens to a CustomEvent/Alpine event."""
+    db = store.db
+    listeners = [{"where": r["src_qname"], "declared_in": _loc(db, r["file_id"], r["line"])}
+                 for r in db.execute("SELECT * FROM edges WHERE kind='LISTENS_JS' "
+                                     "AND dst_qname=? LIMIT ?", ("jsevent:" + name, CAP))]
+    emitters = [{"where": r["src_qname"], "declared_in": _loc(db, r["file_id"], r["line"])}
+                for r in db.execute("SELECT * FROM edges WHERE kind='EMITS_JS' "
+                                    "AND dst_qname=? LIMIT ?", ("jsevent:" + name, CAP))]
+    return {"event": name, "listeners": listeners, "emitters": emitters}
+
+
+def alpine_components(store, query: str = "") -> list[dict]:
+    """Alpine components defined in templates (Hyvä), optionally name-filtered."""
+    db = store.db
+    like = f"%{query}%" if query else "%"
+    return [{"component": r["dst_qname"].removeprefix("alpine:"),
+             "template": r["src_qname"].removeprefix("tpl:"),
+             "declared_in": _loc(db, r["file_id"], r["line"])}
+            for r in db.execute(
+            "SELECT * FROM edges WHERE kind='DEFINES_ALPINE' AND dst_qname LIKE ? LIMIT ?",
+            ("alpine:" + like if query else "alpine:%", CAP))]
 
 
 # ------------------------------------------------------------------ 7. diagnose_plugin
