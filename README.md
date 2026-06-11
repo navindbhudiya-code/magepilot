@@ -64,10 +64,14 @@ Open a new terminal afterwards so `magepilot` is picked up. Then you can run it 
   and **checkpoints every step**: Ctrl-C pauses, `magepilot resume` continues exactly where it left off,
   `magepilot runs` lists past runs.
 - 🕸️ **Knows your Magento wiring exactly** — `magepilot graph` builds a **knowledge graph** of your whole
-  store (DI preferences, plugin chains with sortOrder/area/disabled, observers, dispatch sites, constructor
-  injections — vendor/ included, ~50s for a full 2.4 store). The agent then answers *"what plugins intercept
-  this method?"*, *"what breaks if I change this interface?"* and *"why is my plugin not firing?"* from
-  facts, not grep — including cross-module disables (the MSI-style case text search can never find).
+  store (DI preferences with the real load-order winner, plugin chains with sortOrder/area/disabled,
+  observers + dispatch sites, constructor injections, REST routes, GraphQL resolvers, layout/templates/
+  view models, db_schema tables, cron jobs, a static call graph of your `app/code`, and even **Hyvä Alpine
+  components + browser CustomEvents** — vendor/ included, ~40–80s for a full 2.4 store). The agent then
+  answers *"what plugins intercept this method?"*, *"which service handles `GET /V1/products/:sku`?"*,
+  *"who listens to `private-content-loaded`?"*, *"what breaks if I change this interface — and is it
+  tested?"* from facts, not grep — including cross-module disables (the MSI-style case text search can
+  never find).
 - 🐛 **Debugs from a stack trace** — paste a PHP error into `magepilot do` and it parses the frames, flags
   the culprit (your code before vendor code), reads `var/log/*.log`, root-causes DI/plugin failures via the
   graph, and proposes the smallest fix.
@@ -221,10 +225,11 @@ answers from your store's knowledge graph instead of letting it grep vendor/:
 claude mcp add magepilot -- ~/.magepilot/magepilot mcp-serve --root /path/to/your-store
 ```
 
-That exposes all 21 **read-only** tools (`wiring`, `symbol`, `impact`, `diagnose_plugin`,
+That exposes all the **read-only** tools (`wiring`, `symbol`, `impact`, `diagnose_plugin`,
 `search`, `stack_trace`, `git_log`, `sql_query`, …) over stdio. Claude Code can then ask
-*"what plugins intercept `ProductRepository::save`?"* or *"which service handles
-`GET /V1/products/:sku`?"* and get graph facts, not guesses. Run `magepilot graph` in the
+*"what plugins intercept `ProductRepository::save`?"*, *"which service handles
+`GET /V1/products/:sku`?"*, or *"who calls this method, and is it unit-tested?"* and get
+graph facts, not guesses. Run `magepilot graph` in the
 store once first. Write tools are **excluded by default**; opt in with
 `mcp-serve --allow-writes` (your MCP client's permission prompts then gate them —
 Magepilot's sandbox, linter, and undo still apply).

@@ -175,6 +175,62 @@ def table(info: dict | None, asked: str, note: str = "") -> str:
     return _clip("\n".join(lines))
 
 
+def calls(items: list[dict], target: str, direction: str, note: str = "") -> str:
+    if not items:
+        return (f"no static {direction} recorded for {target} (app/code only; dynamic "
+                f"calls and DI-resolved interfaces are not traced)"
+                + (f"\n{note}" if note else ""))
+    lines = [f"{len(items)} {direction} of {target} (static, app/code only):"]
+    for c in items:
+        arrow = c["caller"] if direction == "callers" else c["callee"]
+        lines.append(f"- {arrow}  ({c['declared_in']})")
+    if note:
+        lines.append(note)
+    return _clip("\n".join(lines))
+
+
+def tests(items: list[dict], target: str, note: str = "") -> str:
+    if not items:
+        return f"no tests found for {target} — consider `magepilot testgen {target}`" \
+               + (f"\n{note}" if note else "")
+    unit = [t for t in items if t["kind"] == "unit"]
+    mftf = [t for t in items if t["kind"] == "mftf"]
+    lines = [f"tests for {target}: {len(unit)} unit, {len(mftf)} MFTF (module-level)"]
+    lines += [f"- [unit] {t['test']}  ({t['declared_in']})" for t in unit]
+    lines += [f"- [mftf] {t['test']}  ({t['declared_in']})" for t in mftf[:6]]
+    if note:
+        lines.append(note)
+    return _clip("\n".join(lines))
+
+
+def js_event(info: dict, note: str = "") -> str:
+    if not info["listeners"] and not info["emitters"]:
+        return f"no browser-side wiring recorded for JS event '{info['event']}'" \
+               + (f"\n{note}" if note else "")
+    lines = [f"JS event '{info['event']}':"]
+    if info["emitters"]:
+        lines.append(f"emitted from {len(info['emitters'])} template(s):")
+        lines += [f"- {e['where'].removeprefix('tpl:')}  ({e['declared_in']})"
+                  for e in info["emitters"]]
+    if info["listeners"]:
+        lines.append(f"listened to in {len(info['listeners'])} template(s):")
+        lines += [f"- {l['where'].removeprefix('tpl:')}  ({l['declared_in']})"
+                  for l in info["listeners"]]
+    if note:
+        lines.append(note)
+    return _clip("\n".join(lines))
+
+
+def alpine(items: list[dict], query: str, note: str = "") -> str:
+    if not items:
+        return f"no Alpine components match '{query or '*'}'" + (f"\n{note}" if note else "")
+    lines = [f"{len(items)} Alpine component(s):"]
+    lines += [f"- {c['component']}  in {c['template']}  ({c['declared_in']})" for c in items]
+    if note:
+        lines.append(note)
+    return _clip("\n".join(lines))
+
+
 def diagnosis(report: dict, note: str = "") -> str:
     lines = [f"diagnosis for plugin {report['plugin']}:"]
     if report["declarations"]:

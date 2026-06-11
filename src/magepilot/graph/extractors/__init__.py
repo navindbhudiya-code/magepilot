@@ -7,7 +7,8 @@ are worse than grep, so the rule stays dumb.
 import re
 
 from magepilot.graph.extractors import (
-    db_schema, di, events, graphqls, jobs, layout, module, php, theme, webapi,
+    alpine, db_schema, di, events, graphqls, jobs, layout, mftf, module, php,
+    theme, webapi,
 )
 
 _AREA_RE = re.compile(
@@ -28,10 +29,19 @@ _ETC_XML = {
 }
 
 
+_VIEW_AREA_RE = re.compile(r"(?:^|/)view/(frontend|adminhtml|base)/")
+
+
 def classify(rel: str) -> tuple[str | None, str | None]:
     """(ftype, area) for a path the graph cares about; (None, None) otherwise."""
     if rel.endswith("registration.php"):
         return "registration", None
+    if "Test/Mftf/" in rel and rel.endswith(".xml"):
+        return "mftf", None
+    if rel.endswith(".phtml"):
+        m = _VIEW_AREA_RE.search(rel)
+        area = m.group(1) if m else None
+        return "phtml", (area if area and area != "base" else "frontend")
     m = _AREA_RE.search(rel)
     if m:
         area, base = m.group(1) or "global", m.group(2)
@@ -63,4 +73,6 @@ EXTRACTORS = {
     "layout": layout.extract,
     "theme": theme.extract,
     "graphqls": graphqls.extract,
+    "phtml": alpine.extract,
+    "mftf": mftf.extract,
 }

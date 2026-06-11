@@ -1504,9 +1504,9 @@ def _():
     d = tempfile.mkdtemp(prefix="magepilot-tgw-")
     shutil.copytree(ROOT, os.path.join(d, "app", "code", "Vendor", "Faq"))
     build_graph(d, verbose=False)
-    res = testgen.write_test(d, "Vendor\\Faq\\Model\\FaqRepository", auto=True, fill=False)
+    res = testgen.write_test(d, "Vendor\\Faq\\Model\\FaqManager", auto=True, fill=False)
     assert_true(res["written"] and os.path.isfile(os.path.join(d, res["path"])), str(res))
-    assert_in("Test/Unit/Model/FaqRepositoryTest.php", res["path"])
+    assert_in("Test/Unit/Model/FaqManagerTest.php", res["path"])
     edits.undo(d)
     assert_true(not os.path.exists(os.path.join(d, res["path"])), "undo must revert the test")
     shutil.rmtree(d, ignore_errors=True)
@@ -1694,6 +1694,127 @@ def _():
                                     "call": lambda self, n, a: "ok"})(), spec, {"lookup"})
     assert_true(ro.risk is RiskLevel.READ and ro.name == "ext_lookup",
                 f"read_only + collision prefix: {ro.name} {ro.risk}")
+
+
+# ================================================================== graph v3
+@test("v3 CALLS: same-class, injected-property, and parent/static calls land")
+def _():
+    build_graph(ROOT, verbose=False)
+    g = get_graph(ROOT)
+    try:
+        callees = gq.callees_of(g, "Vendor\\Faq\\Model\\FaqManager::save")
+        targets = {c["callee"] for c in callees}
+        assert_in("Vendor\\Faq\\Model\\FaqManager::validate", targets)
+        assert_in("Vendor\\Faq\\Api\\FaqRepositoryInterface::getById", targets,
+                  "injected-property call must resolve through the promoted ctor type")
+        assert_true(not any("dispatch" in t for t in targets),
+                    "dispatch is a DISPATCHES edge, never a CALLS edge")
+        callers = gq.callers_of(g, "Vendor\\Faq\\Api\\FaqRepositoryInterface::getById")
+        assert_true(any(c["caller"] == "Vendor\\Faq\\Model\\FaqManager::save"
+                        for c in callers), str(callers))
+    finally:
+        g.close()
+
+
+@test("v3 CALLS: vendor code produces no call edges (volume guard)")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-vcalls-")
+    vdir = os.path.join(d, "vendor", "acme", "module-x")
+    os.makedirs(vdir)
+    open(os.path.join(vdir, "registration.php"), "w").write("<?php // module")
+    open(os.path.join(vdir, "Thing.php"), "w").write(
+        "<?php\nnamespace Acme\\X;\nclass Thing {\n"
+        "    public function a(): void { $this->b(); }\n"
+        "    public function b(): void {}\n}\n")
+    build_graph(d, verbose=False)
+    g = get_graph(d)
+    try:
+        n = g.db.execute("SELECT COUNT(*) FROM edges WHERE kind='CALLS'").fetchone()[0]
+        assert_true(n == 0, f"vendor CALLS must be excluded, got {n}")
+        assert_true(g.db.execute("SELECT 1 FROM nodes WHERE qname='Acme\\X\\Thing'")
+                    .fetchone() is not None, "vendor declarations still indexed")
+    finally:
+        g.close()
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("v3 Alpine: components, listeners, and emitters from the Hyvä template")
+def _():
+    g = get_graph(ROOT)
+    try:
+        comps = gq.alpine_components(g)
+        assert_true(any(c["component"] == "initFaqList" for c in comps), str(comps))
+        c = next(c for c in comps if c["component"] == "initFaqList")
+        assert_true(c["template"] == "Vendor_Faq::faq/list.phtml",
+                    f"template qname must be module-relative: {c['template']}")
+        ev = gq.js_event_info(g, "private-content-loaded")
+        assert_true(len(ev["listeners"]) == 1 and not ev["emitters"], str(ev))
+        ev2 = gq.js_event_info(g, "faq-item-selected")
+        assert_true(len(ev2["emitters"]) == 1, "CustomEvent dispatch must be an emitter")
+        ev3 = gq.js_event_info(g, "faq-list-changed")
+        assert_true(len(ev3["emitters"]) == 1, "$dispatch must be an emitter")
+        out = tools.run_tool(ROOT, "wiring", "private-content-loaded")
+        assert_in("list.phtml", out)
+        out = tools.run_tool(ROOT, "wiring", '{"target": "initFaq", "aspect": "alpine"}')
+        assert_in("initFaqList", out)
+    finally:
+        g.close()
+
+
+@test("v3 coverage: unit COVERS via mirror path + MFTF at module level; tests_for/impact")
+def _():
+    g = get_graph(ROOT)
+    try:
+        cov = g.db.execute("SELECT src_qname, dst_qname FROM edges WHERE kind='COVERS'").fetchall()
+        assert_true(any(r["src_qname"] == "Vendor\\Faq\\Test\\Unit\\Model\\FaqRepositoryTest"
+                        and r["dst_qname"] == "Vendor\\Faq\\Model\\FaqRepository"
+                        for r in cov), str([dict(r) for r in cov]))
+        t = gq.tests_for(g, "Vendor\\Faq\\Model\\FaqRepository")
+        kinds = {x["kind"] for x in t}
+        assert_true(kinds == {"unit", "mftf"}, str(t))
+        assert_true(any(x["test"] == "StorefrontFaqListTest" for x in t))
+        imp = gq.impact_of(g, "Vendor\\Faq\\Model\\FaqRepository")
+        assert_in("tests", imp["relations"])
+        imp_iface = gq.impact_of(g, "Vendor\\Faq\\Api\\FaqRepositoryInterface")
+        assert_in("callers", imp_iface["relations"],
+                  "calls target the injected interface — impact must show them there")
+        import json as _json
+        out = tools.run_tool(ROOT, "wiring", _json.dumps(
+            {"target": "Vendor\\Faq\\Model\\FaqRepository", "aspect": "tests"}))
+        assert_in("FaqRepositoryTest", out)
+        out2 = tools.run_tool(ROOT, "wiring", _json.dumps(
+            {"target": "Vendor\\Faq\\Model\\FaqManager", "aspect": "tests"}))
+        assert_in("0 unit", out2, "no unit test, but module-level MFTF still counts")
+        assert_in("StorefrontFaqListTest", out2)
+    finally:
+        g.close()
+
+
+@test("v3 preference winner follows module load order (later module wins)")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-order-")
+    for mod, seq, impl in (("Va_A", None, "Va\\A\\Model\\Impl"),
+                           ("Va_B", "Va_A", "Va\\B\\Model\\Impl")):
+        v, m = mod.split("_")
+        base = os.path.join(d, "app", "code", v, m)
+        os.makedirs(os.path.join(base, "etc"))
+        open(os.path.join(base, "registration.php"), "w").write("<?php // reg")
+        seq_xml = f"<sequence><module name=\"{seq}\"/></sequence>" if seq else ""
+        open(os.path.join(base, "etc", "module.xml"), "w").write(
+            f'<config><module name="{mod}">{seq_xml}</module></config>')
+        open(os.path.join(base, "etc", "di.xml"), "w").write(
+            f'<config><preference for="Shared\\Api\\ThingInterface" type="{impl}"/></config>')
+    build_graph(d, verbose=False)
+    g = get_graph(d)
+    try:
+        prefs = gq.preference_for(g, "Shared\\Api\\ThingInterface")
+        assert_true(len(prefs) == 2, str(prefs))
+        winner = next(p for p in prefs if p["winner"])
+        assert_true(winner["module"] == "Va_B",
+                    f"Va_B loads after Va_A (sequence) so its preference wins: {winner}")
+    finally:
+        g.close()
+    shutil.rmtree(d, ignore_errors=True)
 
 
 def main() -> int:

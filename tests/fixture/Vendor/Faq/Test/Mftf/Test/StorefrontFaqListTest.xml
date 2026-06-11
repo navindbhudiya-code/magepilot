@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tests xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:noNamespaceSchemaLocation="urn:magento:mftf:Test/etc/testSchema.xsd">
+    <test name="StorefrontFaqListTest">
+        <annotations>
+            <stories value="FAQ"/>
+            <title value="Customer sees the FAQ list"/>
+        </annotations>
+    </test>
+</tests>
