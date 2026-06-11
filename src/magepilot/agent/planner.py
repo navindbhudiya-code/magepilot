@@ -15,8 +15,10 @@
 import re
 
 from magepilot.agent.state import TASK_KINDS, Task
-from magepilot.edits.scaffold import _extract
 from magepilot.llm.router import get_router
+from magepilot.magento.archetypes import (
+    CRON_RE, MODULE_RE, OBSERVER_RE, PLUGIN_RE, THEME_RE, _extract, CREATE as _CREATE,
+)
 
 MAX_TASKS = 6
 
@@ -175,15 +177,16 @@ def _tpl_create_tests(objective, m):
 
 # (name, matcher, builder) — first match wins; matchers are deliberately conservative so
 # anything ambiguous falls through to the LLM planner. create_tests precedes
-# create_module so "create tests for the X module" plans tests, not a module.
-_CREATE = r"(?:create|add|generate|scaffold|build|set ?up|new|make|write)"
+# create_module so "create tests for the X module" plans tests, not a module. The
+# archetype regexes are shared with the make-flow manifests (magento/archetypes.py) so
+# the planner and the file-set rail can never disagree about what a task is.
 TEMPLATES = [
     ("create_tests", re.compile(_CREATE + r"\b.*\b(?:unit )?tests?\b", re.I), _tpl_create_tests),
-    ("create_theme", re.compile(_CREATE + r"\b.*\btheme\b", re.I), _tpl_create_theme),
-    ("create_module", re.compile(_CREATE + r"\b.*\bmodule\b", re.I), _tpl_create_module),
-    ("add_plugin", re.compile(_CREATE + r"\b.*\bplugin\b|intercept\b", re.I), _tpl_add_plugin),
-    ("add_observer", re.compile(_CREATE + r"\b.*\bobserver\b|observe .*event", re.I), _tpl_add_observer),
-    ("add_cron", re.compile(_CREATE + r"\b.*\bcron\b", re.I), _tpl_add_cron),
+    ("create_theme", THEME_RE, _tpl_create_theme),
+    ("create_module", MODULE_RE, _tpl_create_module),
+    ("add_plugin", PLUGIN_RE, _tpl_add_plugin),
+    ("add_observer", OBSERVER_RE, _tpl_add_observer),
+    ("add_cron", CRON_RE, _tpl_add_cron),
     ("debug", re.compile(r"\b(debug|fix|error|exception|stack trace|not working|broken)\b", re.I), _tpl_debug),
 ]
 

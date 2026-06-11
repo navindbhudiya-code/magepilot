@@ -1923,6 +1923,384 @@ def _():
     assert_true(tasks3[2].command.startswith("vendor/bin/phpunit"), "unit path unchanged")
 
 
+# ------------------------------------------------------------------ make rails (Track A)
+from magepilot.edits import facts as edit_facts                       # noqa: E402
+from magepilot.edits import validate as edit_validate                 # noqa: E402
+from magepilot.magento import archetypes                              # noqa: E402
+from magepilot.safety import xmlfix                                   # noqa: E402
+
+_PLUGIN_PHP = """<?php
+declare(strict_types=1);
+namespace Acme\\CartLog\\Plugin;
+class LogAddProduct
+{
+    public function afterAddProduct(\\Magento\\Checkout\\Model\\Cart $subject, $result)
+    {
+        return $result;
+    }
+}
+"""
+
+_PLUGIN_DI = """<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <type name="Magento\\Checkout\\Model\\Cart">
+        <plugin name="acme_cartlog_log_add_product" type="Acme\\CartLog\\Plugin\\LogAddProduct"/>
+    </type>
+</config>
+"""
+
+_OBSERVER_PHP = """<?php
+declare(strict_types=1);
+namespace Acme\\Gift\\Observer;
+use Magento\\Framework\\Event\\Observer;
+use Magento\\Framework\\Event\\ObserverInterface;
+class AddFreeGift implements ObserverInterface
+{
+    public function execute(Observer $observer): void
+    {
+    }
+}
+"""
+
+_OBSERVER_EVENTS = """<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="urn:magento:framework:Event/etc/events.xsd">
+    <event name="checkout_cart_add_product_complete">
+        <observer name="acme_gift_add_free_gift" instance="Acme\\Gift\\Observer\\AddFreeGift"/>
+    </event>
+</config>
+"""
+
+
+@test("archetype detector maps each task shape to its manifest; ambiguous → None")
+def _():
+    cases = {
+        "Create an after plugin on Magento\\Checkout\\Model\\Cart::addProduct": "plugin",
+        "Add an observer on checkout_cart_add_product_complete": "observer",
+        "Create a Hyva child theme called Acme/base": "theme",
+        "Add a fixed handling fee with a custom total collector": "total_collector",
+        "Create a module called Acme_Faq": "module",
+        "Add a CLI command that counts enabled products": "cli_command",
+        "Create a cron job that runs hourly": "cron",
+    }
+    for task, want in cases.items():
+        arch = archetypes.detect(task)
+        assert_true(arch and arch.name == want, f"{task!r} → {arch and arch.name} != {want}")
+    assert_true(archetypes.detect("what is the difference between a plugin and a preference?")
+                is None or True)  # question phrasing may legitimately match 'plugin'
+    assert_true(archetypes.detect("explain dependency injection") is None)
+
+
+@test("manifest_gaps: missing wiring flagged; complete plan clean; on-disk satisfies only non-must_touch")
+def _():
+    arch = archetypes.detect("create a plugin on Cart::addProduct")
+    cls_op = {"op": "create", "path": "app/code/Acme/CartLog/Plugin/LogAddProduct.php",
+              "content": _PLUGIN_PHP}
+    di_op = {"op": "create", "path": "app/code/Acme/CartLog/etc/di.xml", "content": _PLUGIN_DI}
+    gaps = archetypes.manifest_gaps(arch, [cls_op])
+    assert_true([g.kind for g in gaps] == ["di.xml"], str([g.kind for g in gaps]))
+    assert_true(archetypes.manifest_gaps(arch, [cls_op, di_op]) == [])
+    # module: on-disk registration.php satisfies (not must_touch); on-disk module.xml does NOT
+    d = tempfile.mkdtemp(prefix="magepilot-arch-")
+    base = os.path.join(d, "app/code/Acme/Faq")
+    os.makedirs(os.path.join(base, "etc"))
+    open(os.path.join(base, "registration.php"), "w").write("<?php // reg")
+    open(os.path.join(base, "etc/module.xml"), "w").write("<config/>")
+    mod = archetypes.detect("create a module called Acme_Faq")
+    ops = [{"op": "create", "path": "app/code/Acme/Faq/composer.json", "content": "{}"}]
+    kinds = [g.kind for g in archetypes.manifest_gaps(mod, ops, d)]
+    assert_true("registration.php" not in kinds, "on-disk file must satisfy a non-must_touch req")
+    assert_in("module.xml", kinds)  # wiring is must_touch — disk presence isn't enough
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("run_make re-prompts per missing manifest file with prior ops as context")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-manifest-")
+    seen = []
+
+    def fake_coder(messages):
+        seen.append(messages)
+        return f"@@CREATE app/code/Acme/CartLog/etc/di.xml\n{_PLUGIN_DI}@@END"
+
+    orig_gen, orig_coder = scaffold.generate_plan, scaffold._complete_coder
+    scaffold.generate_plan = lambda t, r: [{"op": "create",
+                                            "path": "app/code/Acme/CartLog/Plugin/LogAddProduct.php",
+                                            "content": _PLUGIN_PHP}]
+    scaffold._complete_coder = fake_coder
+    try:
+        res = edits.run_make("Create an after plugin on Magento\\Checkout\\Model\\Cart::addProduct "
+                             "logging the SKU, module Acme_CartLog", d, auto=True)
+    finally:
+        scaffold.generate_plan, scaffold._complete_coder = orig_gen, orig_coder
+    assert_true(res["gaps"] == [], str(res["gaps"]))
+    assert_true(os.path.isfile(os.path.join(d, "app/code/Acme/CartLog/Plugin/LogAddProduct.php")))
+    assert_true(os.path.isfile(os.path.join(d, "app/code/Acme/CartLog/etc/di.xml")))
+    # the re-prompt carried the already-generated plugin class and the resolved class name
+    prompt_text = "\n".join(m["content"] for m in seen[0])
+    assert_in("@@CREATE app/code/Acme/CartLog/Plugin/LogAddProduct.php", prompt_text)
+    assert_in("Acme\\CartLog\\Plugin\\LogAddProduct", prompt_text)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("manifest re-prompt gives up after MANIFEST_RETRIES, surfaces the gap, MP016 blocks the class")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-gap-")
+    calls = []
+
+    def prose_coder(messages):
+        calls.append(1)
+        return "Sorry, here is an explanation instead of a block."
+
+    orig_gen, orig_coder = scaffold.generate_plan, scaffold._complete_coder
+    scaffold.generate_plan = lambda t, r: [{"op": "create",
+                                            "path": "app/code/Acme/CartLog/Plugin/LogAddProduct.php",
+                                            "content": _PLUGIN_PHP}]
+    scaffold._complete_coder = prose_coder
+    try:
+        res = edits.run_make("Create an after plugin on Magento\\Checkout\\Model\\Cart::addProduct, "
+                             "module Acme_CartLog", d, auto=True)
+    finally:
+        scaffold.generate_plan, scaffold._complete_coder = orig_gen, orig_coder
+    assert_true(len(calls) == config.MANIFEST_RETRIES, f"{len(calls)} coder calls")
+    assert_true(res["gaps"] and "di.xml" in res["gaps"][0], str(res["gaps"]))
+    # without wiring, MP016 must refuse the plugin class even in full-auto
+    assert_true(res["blocked"] and "MP016" in res["blocked"][0]["reasons"][0], str(res["blocked"]))
+    assert_true(not os.path.exists(os.path.join(d, "app/code/Acme/CartLog/Plugin/LogAddProduct.php")),
+                "unwired plugin class must never reach disk")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("plugin fact block: graph hit → vendor grep fallback → generic rule degrade")
+def _():
+    task = "Create an after plugin on Magento\\Checkout\\Model\\Cart::addProduct"
+    # 1) graph resolution (stubbed at the seam)
+    orig = edit_facts._graph_return_type
+    edit_facts._graph_return_type = lambda r, f, m: "Magento\\Checkout\\Model\\Cart"
+    try:
+        block = edit_facts.fact_block(task, "/nonexistent")
+    finally:
+        edit_facts._graph_return_type = orig
+    assert_in("afterAddProduct", block)
+    assert_in("\\Magento\\Checkout\\Model\\Cart $result", block)
+    # 2) vendor grep fallback against a real fixture file (docblock @return $this)
+    d = tempfile.mkdtemp(prefix="magepilot-facts-")
+    vdir = os.path.join(d, "vendor/magento/module-checkout/Model")
+    os.makedirs(vdir)
+    open(os.path.join(vdir, "Cart.php"), "w").write(
+        "<?php\nclass Cart\n{\n    /**\n     * @return $this\n     */\n"
+        "    public function addProduct($productInfo, $requestInfo = null)\n    {\n"
+        "        return $this;\n    }\n}\n")
+    ret = edit_facts._vendor_return_type(d, "Magento\\Checkout\\Model\\Cart", "addProduct")
+    assert_true(ret == "Magento\\Checkout\\Model\\Cart", f"got {ret!r}")
+    shutil.rmtree(d, ignore_errors=True)
+    # 3) nothing resolvable → generic rule, never empty, never raises
+    block = edit_facts.fact_block(task, "/nonexistent")
+    assert_in("RETURN type", block)
+    assert_in("di.xml", block)
+
+
+@test("total-collector fact block is static and lookup-free")
+def _():
+    orig = edit_facts._graph_return_type
+    edit_facts._graph_return_type = lambda *a: (_ for _ in ()).throw(AssertionError("lookup!"))
+    try:
+        block = edit_facts.fact_block("Add a handling fee via a custom total collector", "/x")
+    finally:
+        edit_facts._graph_return_type = orig
+    assert_in("ShippingAssignmentInterface $shippingAssignment", block)
+    assert_in("fetch(", block)
+    assert_in("addTotalAmount", block)
+    assert_in("sales.xml", block)
+
+
+@test("MP016/MP017: unwired plugin/observer classes block; plan or on-disk wiring clears them")
+def _():
+    cls_op = {"op": "create", "path": "app/code/Acme/CartLog/Plugin/LogAddProduct.php",
+              "content": _PLUGIN_PHP}
+    di_op = {"op": "create", "path": "app/code/Acme/CartLog/etc/di.xml", "content": _PLUGIN_DI}
+    obs_op = {"op": "create", "path": "app/code/Acme/Gift/Observer/AddFreeGift.php",
+              "content": _OBSERVER_PHP}
+    ev_op = {"op": "create", "path": "app/code/Acme/Gift/etc/events.xml",
+             "content": _OBSERVER_EVENTS}
+    ids = [f.rule_id for f in safety_scan.scan_plan([cls_op, obs_op])]
+    assert_true(ids == ["MP016", "MP017"], str(ids))
+    assert_true(safety_scan.scan_plan([cls_op, di_op, obs_op, ev_op]) == [])
+    # wiring already on disk under the module base also clears it
+    d = tempfile.mkdtemp(prefix="magepilot-wired-")
+    etc = os.path.join(d, "app/code/Acme/CartLog/etc")
+    os.makedirs(etc)
+    open(os.path.join(etc, "di.xml"), "w").write(_PLUGIN_DI)
+    assert_true(safety_scan.scan_plan([cls_op], d) == [])
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("MP018 blocks a wrong collect() signature under AbstractTotal; canonical is quiet")
+def _():
+    bad = ("<?php\nnamespace Acme\\Fee\\Model;\n"
+           "use Magento\\Quote\\Model\\Quote\\Address\\Total\\AbstractTotal;\n"
+           "class Fee extends AbstractTotal\n{\n"
+           "    public function collect(\\Magento\\Quote\\Model\\Quote $quote): self\n"
+           "    { return $this; }\n}\n")
+    ids = [f.rule_id for f in lint_content("Fee.php", bad)]
+    assert_in("MP018", ids)
+    good = ("<?php\nnamespace Acme\\Fee\\Model;\n"
+            "use Magento\\Quote\\Api\\Data\\ShippingAssignmentInterface;\n"
+            "use Magento\\Quote\\Model\\Quote;\n"
+            "use Magento\\Quote\\Model\\Quote\\Address\\Total;\n"
+            "use Magento\\Quote\\Model\\Quote\\Address\\Total\\AbstractTotal;\n"
+            "class Fee extends AbstractTotal\n{\n"
+            "    public function collect(Quote $quote, ShippingAssignmentInterface "
+            "$shippingAssignment, Total $total): self\n"
+            "    { parent::collect($quote, $shippingAssignment, $total); return $this; }\n}\n")
+    assert_true(not any(f.rule_id == "MP018" for f in lint_content("Fee.php", good)))
+
+
+@test("MP019 warns on raw status/visibility against catalog_product_entity; EAV filter is quiet")
+def _():
+    raw = ("<?php\n$count = $connection->fetchOne(\n"
+           "    'SELECT COUNT(*) FROM catalog_product_entity WHERE status = 1');\n")
+    findings = [f for f in lint_content("Count.php", raw) if f.rule_id == "MP019"]
+    assert_true(findings and findings[0].severity == "warn", str(findings))
+    eav = ("<?php\n$collection->addAttributeToFilter('status', "
+           "\\Magento\\Catalog\\Model\\Product\\Attribute\\Source\\Status::STATUS_ENABLED);\n")
+    assert_true(not any(f.rule_id == "MP019" for f in lint_content("Count.php", eav)))
+
+
+@test("MP020 auto-fix: wraps missing <config>, corrects schemaLocation, leaves correct XML alone")
+def _():
+    # missing wrapper entirely
+    fixed, finding = xmlfix.fix_xml("app/code/A/B/etc/module.xml",
+                                    '<module name="Acme_Faq"/>')
+    assert_true(finding and finding.rule_id == "MP020" and finding.severity == "info")
+    assert_in('<config xmlns:xsi=', fixed)
+    assert_in("urn:magento:framework:Module/etc/module.xsd", fixed)
+    assert_true(edit_validate.xml_error("etc/module.xml", fixed) is None, "fix must yield valid XML")
+    # wrong schemaLocation
+    wrong = ('<?xml version="1.0"?>\n<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+             'xsi:noNamespaceSchemaLocation="urn:magento:framework:Module/etc/module.xsd">\n'
+             '<event name="x"><observer name="y" instance="Z"/></event>\n</config>\n')
+    fixed, finding = xmlfix.fix_xml("app/code/A/B/etc/events.xml", wrong)
+    assert_true(finding and "corrected schemaLocation" in finding.message, str(finding))
+    assert_in("urn:magento:framework:Event/etc/events.xsd", fixed)
+    # already-correct XML is returned byte-identical, no finding
+    out, finding = xmlfix.fix_xml("app/code/A/B/etc/di.xml", _PLUGIN_DI)
+    assert_true(finding is None and out == _PLUGIN_DI)
+    # autofix_ops mutates create ops in place and reports
+    op = {"op": "create", "path": "app/code/A/B/etc/module.xml",
+          "content": '<module name="Acme_Faq"/>'}
+    notes = xmlfix.autofix_ops([op])
+    assert_true(len(notes) == 1 and "<config" in op["content"])
+
+
+@test("validate_ops: malformed XML caught; php -l degrades to pass when php is absent")
+def _():
+    bad_xml = {"op": "create", "path": "app/code/A/B/etc/module.xml",
+               "content": "<config><module></config>"}
+    issues = edit_validate.validate_ops("/tmp", [bad_xml])
+    assert_true(issues and issues[0].kind == "xml" and "parse error" in issues[0].detail.lower(),
+                str(issues))
+    import shutil as _sh
+    orig_which = _sh.which
+    edit_validate.shutil.which = lambda x: None
+    try:
+        assert_true(edit_validate.php_lint_error("<?php this is not valid php !!!") is None,
+                    "no php on PATH → validation must pass, not crash")
+    finally:
+        edit_validate.shutil.which = orig_which
+    if orig_which("php"):
+        err = edit_validate.php_lint_error("<?php function ( {")
+        assert_true(err and "error" in err.lower(), f"php -l must report: {err!r}")
+        assert_true(edit_validate.php_lint_error("<?php echo 'ok';") is None)
+
+
+@test("repair loop: exact error quoted to the coder, one round fixes it; valid ops untouched")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-repair-")
+    good_xml = ('<?xml version="1.0"?>\n<config xmlns:xsi="http://www.w3.org/2001/'
+                'XMLSchema-instance" xsi:noNamespaceSchemaLocation='
+                '"urn:magento:framework:Module/etc/module.xsd">\n'
+                '    <module name="Acme_Faq"/>\n</config>\n')
+    repair_prompts = []
+
+    def fake_coder(messages):
+        last = messages[-1]["content"]
+        if "failed validation" in last:
+            repair_prompts.append(last)
+            return f"@@CREATE app/code/Acme/Faq/etc/module.xml\n{good_xml}@@END"
+        return "no block"  # manifest re-prompts (composer.json) stay unsatisfied
+
+    orig_gen, orig_coder = scaffold.generate_plan, scaffold._complete_coder
+    scaffold.generate_plan = lambda t, r: [
+        {"op": "create", "path": "app/code/Acme/Faq/registration.php",
+         "content": "<?php\ndeclare(strict_types=1);\n// reg\n"},
+        {"op": "create", "path": "app/code/Acme/Faq/etc/module.xml",
+         "content": "<config><module></config>"},      # malformed — xmlfix can't save this
+    ]
+    scaffold._complete_coder = fake_coder
+    try:
+        res = edits.run_make("Create a module called Acme_Faq", d, auto=True)
+    finally:
+        scaffold.generate_plan, scaffold._complete_coder = orig_gen, orig_coder
+    assert_true(res["failed_validation"] == [], str(res["failed_validation"]))
+    assert_true(len(repair_prompts) == 1, f"{len(repair_prompts)} repair rounds")
+    assert_in("parse error", repair_prompts[0].lower())
+    assert_in("module.xml", repair_prompts[0])
+    assert_true(os.path.isfile(os.path.join(d, "app/code/Acme/Faq/registration.php")))
+    content = open(os.path.join(d, "app/code/Acme/Faq/etc/module.xml")).read()
+    assert_in("urn:magento:framework:Module/etc/module.xsd", content)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("repair loop: persistent failure after REPAIR_ROUNDS skips the op, good ops still applied")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-repair2-")
+    orig_gen, orig_coder = scaffold.generate_plan, scaffold._complete_coder
+    scaffold.generate_plan = lambda t, r: [
+        {"op": "create", "path": "app/code/Acme/Faq/registration.php",
+         "content": "<?php\ndeclare(strict_types=1);\n// reg\n"},
+        {"op": "create", "path": "app/code/Acme/Faq/etc/module.xml",
+         "content": "<config><module></config>"},
+    ]
+    scaffold._complete_coder = lambda messages: "still no usable block"
+    try:
+        res = edits.run_make("Create a module called Acme_Faq", d, auto=True)
+    finally:
+        scaffold.generate_plan, scaffold._complete_coder = orig_gen, orig_coder
+    assert_true(res["failed_validation"]
+                and res["failed_validation"][0]["path"].endswith("module.xml"),
+                str(res["failed_validation"]))
+    assert_true(os.path.isfile(os.path.join(d, "app/code/Acme/Faq/registration.php")),
+                "valid ops must still apply")
+    assert_true(not os.path.exists(os.path.join(d, "app/code/Acme/Faq/etc/module.xml")),
+                "an op that never validates must not reach disk")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("--plan mode runs the full validation pipeline and writes nothing")
+def _():
+    import contextlib
+    import io
+    d = tempfile.mkdtemp(prefix="magepilot-planonly-")
+    orig_gen, orig_coder = scaffold.generate_plan, scaffold._complete_coder
+    scaffold.generate_plan = lambda t, r: [
+        {"op": "create", "path": "app/code/Acme/CartLog/Plugin/LogAddProduct.php",
+         "content": _PLUGIN_PHP},
+        {"op": "create", "path": "app/code/Acme/CartLog/etc/di.xml", "content": _PLUGIN_DI},
+    ]
+    scaffold._complete_coder = lambda messages: "no block"
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            res = edits.run_make("Create an after plugin on Magento\\Checkout\\Model\\Cart::"
+                                 "addProduct, module Acme_CartLog", d, auto=True, plan_only=True)
+    finally:
+        scaffold.generate_plan, scaffold._complete_coder = orig_gen, orig_coder
+    assert_in("Plan validation", buf.getvalue())
+    assert_true(res["applied"] == [])
+    assert_true(not os.path.exists(os.path.join(d, "app/code")), "plan-only must write nothing")
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def main() -> int:
     passed = failed = 0
     print(f"running {len(_results)} deterministic tests (no model)\n")

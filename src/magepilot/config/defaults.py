@@ -74,6 +74,11 @@ DB_ROW_LIMIT = 200              # auto-applied LIMIT for SELECTs that don't have
 DB_MODE = os.environ.get("AGENT_DB_MODE", "auto")          # auto | host | docker | warden
 DB_CONTAINER = os.environ.get("AGENT_DB_CONTAINER", "")    # docker mode: the db container name
 
+# --- Deterministic make rails (docs/architecture/03/07) ---
+MANIFEST_RETRIES = 2            # coder re-prompts per missing manifest file
+REPAIR_ROUNDS = 2               # validate→repair loop rounds after plan assembly
+PHP_LINT_TIMEOUT = 20           # seconds for `php -l` (validation skips when php is absent)
+
 # --- Safety: the ONLY bin/magento subcommands the agent may run (read-only) ---
 MAGENTO_CLI_WHITELIST = (
     "module:status",

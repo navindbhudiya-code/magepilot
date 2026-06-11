@@ -212,6 +212,10 @@ def _execute_edit(run, task, *, approver, asker, auto, verbose) -> tuple[bool, s
     for b in res.get("blocked", []):
         # the lint feedback the model needs to regenerate compliant code on retry
         out += f"; BLOCKED {b['path']}: " + "; ".join(b["reasons"])
+    for g in res.get("gaps", []):
+        out += f"; MANIFEST GAP: {g}"
+    for fv in res.get("failed_validation", []):
+        out += f"; INVALID {fv['path']}: {fv['error']}"
     return bool(applied), out, False
 
 

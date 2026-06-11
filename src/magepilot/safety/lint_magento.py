@@ -89,6 +89,37 @@ RULES = (
          r"\A(?![\s\S]{0,200}declare\s*\(\s*strict_types\s*=\s*1\s*\))",
          "missing declare(strict_types=1)",
          "add `declare(strict_types=1);` directly after `<?php`"),
+    # MP016/MP017 are PLAN rules — cross-file, enforced in scan.scan_plan; catalog entries only
+    Rule("MP016", BLOCK, (),
+         r"$^",  # never matches content; scan_plan enforces it across the whole plan
+         "plugin class has no matching <plugin> entry in any di.xml of this change set",
+         "add <type name=\"<intercepted class>\"><plugin name=\"...\" type=\"<plugin class>\"/></type> "
+         "to etc/di.xml (or the area's etc/<area>/di.xml)"),
+    Rule("MP017", BLOCK, (),
+         r"$^",
+         "observer class has no matching <observer> entry in any events.xml of this change set",
+         "add <event name=\"<event>\"><observer name=\"...\" instance=\"<observer class>\"/></event> "
+         "to etc/events.xml (or the area's etc/<area>/events.xml)"),
+    Rule("MP018", BLOCK, ("*.php",),
+         r"extends\s+\\?(?:[\w\\]+\\)?AbstractTotal\b[\s\S]+?function\s+collect\s*\("
+         r"(?![^)]*ShippingAssignment)",
+         "collect() signature mismatch — AbstractTotal::collect requires "
+         "(Quote $quote, ShippingAssignmentInterface $shippingAssignment, Total $total)",
+         "public function collect(Quote $quote, ShippingAssignmentInterface $shippingAssignment, "
+         "Total $total): self — and mutate $total via addTotalAmount/setBaseTotalAmount"),
+    Rule("MP019", WARN, ("*.php",),
+         r"catalog_product_entity\b(?!_)[\s\S]{0,300}?"
+         r"(?:['\"](?:status|visibility)['\"]|\b(?:status|visibility)\s*(?:=|!=|<>|\bIN\b))"
+         r"|(?:['\"](?:status|visibility)['\"]|\b(?:status|visibility)\s*(?:=|!=|<>))"
+         r"[\s\S]{0,300}?catalog_product_entity\b(?!_)",
+         "status/visibility are EAV attributes, not columns on catalog_product_entity",
+         "filter via the product collection: addAttributeToFilter('status', Status::STATUS_ENABLED) "
+         "— raw values live in catalog_product_entity_int, not the entity table"),
+    # MP020 is an AUTO-FIX rule — safety/xmlfix.py repairs the XML deterministically and
+    # reports an INFO finding; catalog entry only
+    Rule("MP020", INFO, (),
+         r"$^",
+         "Magento config XML missing its <config> wrapper or schemaLocation (auto-fixed)"),
 )
 
 
