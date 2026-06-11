@@ -128,10 +128,15 @@ Only the bundled **model server** needs Apple Silicon — the **RAG layer and th
    - **RAG:** set `MODEL_SERVER` in `rag/config.py` to the same URL.
 3. Then use `python -m magepilot …` and `python rag/ask.py …` exactly as in **Use it** below.
 
-> **Note on the fine-tune:** the published weights are **MLX-only** for now, so on other platforms you run
-> the **base Qwen2.5-Coder**. You keep the full **agent** (it reasons on the base model anyway) and **RAG**
-> facts; you lose only the Magento *style* fine-tune until the weights are converted to GGUF/HF format.
-> WSL2 is Linux — MLX won't run inside it, but serving via Ollama/llama.cpp + the RAG/agent works there.
+> **The fine-tune runs here too (GGUF):** pull the Magento style layer straight into Ollama —
+> ```bash
+> ollama run hf.co/navindbhudiya/qwen2.5-coder-7b-magento-v4-gguf:Q4_K_M
+> ```
+> then `export MODEL_SERVER=http://localhost:11434/v1`. Q4_K_M (4.4 GB, recommended) and Q8_0
+> (7.5 GB, near-lossless) are published; a ready `Modelfile` with the right sampling defaults lives at
+> [`scripts/Modelfile`](scripts/Modelfile), and the whole conversion is reproducible via
+> [`scripts/convert-gguf.sh`](scripts/convert-gguf.sh). WSL2 is Linux — MLX won't run inside it, but
+> Ollama/llama.cpp + the agent, RAG, and knowledge graph all do.
 
 ## Start it
 

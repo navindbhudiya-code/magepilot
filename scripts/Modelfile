@@ -1,0 +1,22 @@
+# Magepilot fine-tune for Ollama.
+#   ollama create magepilot -f scripts/Modelfile      (run from the dir holding the .gguf)
+# Or straight from Hugging Face (no download step):
+#   ollama run hf.co/navindbhudiya/qwen2.5-coder-7b-magento-v4-gguf:Q4_K_M
+FROM ./qwen2.5-coder-7b-magento-v4-q4_k_m.gguf
+
+# the serving defaults Magepilot uses — greedy decoding makes 7B coders loop
+PARAMETER temperature 0.3
+PARAMETER top_p 0.95
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 8192
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ .Response }}"""
+
+SYSTEM """You are a senior Magento 2 engineer. Write modern, idiomatic Magento 2 + Hyvä code: PHP 8 constructor property promotion, declare(strict_types=1), service contracts and constructor DI (never ObjectManager), declarative schema, escaped template output, Alpine.js + Tailwind for Hyvä."""

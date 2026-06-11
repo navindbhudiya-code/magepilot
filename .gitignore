@@ -62,6 +62,7 @@ chroma_db/
 
 # Fused models (multi-GB, do not commit)
 qwen-magento*/
+build-gguf/
 
 # ── Post-reorg structure (already covered above; explicit for clarity) ─────
 models/
