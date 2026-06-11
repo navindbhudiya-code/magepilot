@@ -81,6 +81,19 @@ def _indent(text: str, pad: str = "        ") -> str:
     return "\n".join(pad + ln for ln in (text or "(no output)").splitlines()[:40])
 
 
+def _attach_mcp(root: str) -> None:
+    """Spawn the user's configured MCP servers (config.toml [mcp_servers.*]) and add
+    their tools to the registry. No servers configured → no-op; failures warn only."""
+    try:
+        cfg = config.load(root)
+        if cfg.mcp_servers:
+            from magepilot.mcp.client import attach
+            from magepilot.tools import REGISTRY
+            attach(REGISTRY, cfg)
+    except Exception as e:
+        print(f"mcp: attach failed: {e}", file=sys.stderr)
+
+
 def _drive(run, *, auto: bool, quiet: bool) -> int:
     """Run the orchestrator with two-stage Ctrl-C: first → finish the current call,
     checkpoint, pause; second → hard exit (the last checkpoint is already on disk)."""
@@ -147,6 +160,8 @@ def main(argv=None) -> int:
     p_do.add_argument("--root")
     p_do.add_argument("--auto-approve", action="store_true",
                       help="apply file changes and ASK-tier commands without asking")
+    p_do.add_argument("--mode", default="code",
+                      help="ask | code | architect | debug | review | refactor | test | autonomous")
     p_do.add_argument("--quiet", action="store_true")
 
     p_res = sub.add_parser("resume", help="resume a paused/interrupted run")
@@ -163,6 +178,18 @@ def main(argv=None) -> int:
 
     p_rev = sub.add_parser("review", help="review the uncommitted diff (advisory)")
     p_rev.add_argument("--root")
+
+    p_tg = sub.add_parser("testgen", help="generate a PHPUnit unit test for a class")
+    p_tg.add_argument("fqcn", help="the class FQCN, e.g. 'Vendor\\\\Faq\\\\Model\\\\FaqRepository'")
+    p_tg.add_argument("--root")
+    p_tg.add_argument("--skeleton", action="store_true",
+                      help="deterministic skeleton only — skip the model body fill")
+    p_tg.add_argument("--auto-approve", action="store_true")
+
+    p_mcp = sub.add_parser("mcp-serve", help="expose MagePilot's tools as an MCP stdio server")
+    p_mcp.add_argument("--root")
+    p_mcp.add_argument("--allow-writes", action="store_true",
+                       help="also expose write tools (auto-approved — the MCP client gates them)")
 
     args = ap.parse_args(argv)
 
@@ -214,7 +241,8 @@ def main(argv=None) -> int:
 
     if args.cmd == "do":
         root = _resolve_root(args.root)
-        run = loop.start(args.objective, root)
+        _attach_mcp(root)
+        run = loop.start(args.objective, root, mode=args.mode)
         print(f"run {run.run_id}" + (f"  (template: {run.template})" if run.template else ""))
         return _drive(run, auto=args.auto_approve, quiet=args.quiet)
 
@@ -227,6 +255,7 @@ def main(argv=None) -> int:
                 return 1
             rid = resumable[0]["run_id"]
         run = loop.resume(rid)
+        _attach_mcp(run.root)
         if run.status not in ("running",):
             print(f"run {rid} is '{run.status}' — nothing to resume.", file=sys.stderr)
             return 1
@@ -247,6 +276,21 @@ def main(argv=None) -> int:
         root = _resolve_root(args.root)
         build_graph(root, vendor=not args.no_vendor)
         return 0
+
+    if args.cmd == "mcp-serve":
+        from magepilot.mcp.server import serve as mcp_serve
+        root = _resolve_root(args.root)
+        mcp_serve(root, allow_writes=args.allow_writes)
+        return 0
+
+    if args.cmd == "testgen":
+        from magepilot.testgen import write_test
+        root = _resolve_root(args.root)
+        res = write_test(root, args.fqcn, approver=_edit_approver,
+                         auto=args.auto_approve, fill=not args.skeleton)
+        if res["written"]:
+            print(f"\n\u2713 wrote {res['path']}  (run it with: vendor/bin/phpunit {res['path']})")
+        return 0 if res["written"] else 1
 
     if args.cmd == "review":
         from magepilot.review.reviewer import review_uncommitted

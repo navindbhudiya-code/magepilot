@@ -19,7 +19,7 @@ import os
 import time
 
 from magepilot import config
-from magepilot.agent import compress, planner, react, state as st
+from magepilot.agent import compress, modes, planner, react, state as st
 from magepilot.config.schema import LimitsCfg
 from magepilot.edits.scaffold import run_make
 from magepilot.memory import recall
@@ -32,7 +32,7 @@ MAX_TASK_ATTEMPTS = 2
 
 def start(objective: str, root: str, *, mode: str = "code") -> st.RunState:
     """PLAN: build a new run (template-first; LLM fallback; never fails)."""
-    template, tasks = planner.plan(objective)
+    template, tasks = planner.plan(objective, mode=mode)
     try:
         memory_block = recall.recall_block(root, objective)
     except Exception:
@@ -63,7 +63,8 @@ def run_loop(run: st.RunState, *, approver=None, asker=None, auto: bool = False,
              cancel=None, verbose: bool = True,
              limits: LimitsCfg | None = None) -> st.RunState:
     """Drive the run to a terminal state. Returns the final RunState (also checkpointed)."""
-    limits = limits or config.load(run.root).limits
+    mode = modes.get(run.mode)
+    limits = modes.apply_limits(mode, limits or config.load(run.root).limits)
     deadline = time.monotonic() + limits.wall_clock_minutes * 60
     allow_always: set = set()
 
@@ -152,7 +153,7 @@ def _execute(run, task, *, limits, approver, asker, auto, cancel,
 
 
 def _addendum(run, task) -> str:
-    parts = []
+    parts = [f"Mode: {run.mode} — {modes.get(run.mode).prompt}"]
     if run.memory_block:
         parts.append(run.memory_block)
     parts.append(f"Current task ({task.kind}): {task.goal}")
@@ -179,7 +180,8 @@ def _execute_react(run, task, *, limits, cancel, verbose) -> tuple[bool, str, bo
                            max_steps=min(limits.max_task_steps, remaining),
                            verbose=verbose, system_addendum=_addendum(run, task),
                            initial_scratchpad=run.executor_scratchpad,
-                           on_step=on_step, cancel=cancel)
+                           on_step=on_step, cancel=cancel,
+                           tools_subset=modes.get(run.mode).tools)
     except Exception as e:                                 # model server down etc.
         return False, f"executor unavailable: {e}", False
     run.steps_used += len(result["steps"])

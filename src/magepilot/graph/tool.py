@@ -35,10 +35,25 @@ def symbol(g, name: str, kind: str = None) -> str:
     return fmt.refs(hits, f"'{name}'") + (f"\n{note}" if note else "")
 
 
+_ROUTEISH = re.compile(r"^(GET|POST|PUT|DELETE|PATCH)?\s*/?V\d+/", re.I)
+_GQLISH = re.compile(r"^(Query|Mutation)\.\w+$")
+
+
 @_with_graph
 def wiring(g, target: str, aspect: str = None, area: str = None) -> str:
     note = queries.partial_note(g)
     target = target.strip().lstrip("\\")
+    # explicit aspects + cheap auto-detection for unmistakable shapes
+    if aspect == "route" or (aspect is None and _ROUTEISH.match(target)):
+        parts = target.split(None, 1)
+        http, path = (parts if len(parts) == 2 else ("GET", parts[0]))
+        return fmt.route(queries.what_handles_route(g, http, path), target, note)
+    if aspect == "graphql" or (aspect is None and _GQLISH.match(target)):
+        return fmt.gql(queries.graphql_resolver(g, target), target, note)
+    if aspect == "template" or (aspect is None and target.endswith(".phtml")):
+        return fmt.template(queries.template_context(g, target), note)
+    if aspect == "table":
+        return fmt.table(queries.table_info(g, target), target, note)
     if aspect in ("observers", "events") or (aspect is None and _EVENTISH.match(target)):
         obs, disp = queries.observers_of(g, target, area=area)
         return fmt.observers(obs, disp, target, note)
@@ -50,7 +65,8 @@ def wiring(g, target: str, aspect: str = None, area: str = None) -> str:
         if prefs:
             out += "\n" + fmt.preferences(prefs, target)
         return out + (f"\n{note}" if note else "")
-    return f"unknown aspect '{aspect}' — use plugins | preference | observers"
+    return ("unknown aspect '" + aspect + "' — use plugins | preference | observers | "
+            "route | graphql | template | table")
 
 
 @_with_graph
@@ -74,14 +90,17 @@ TOOLS = (
     ),
     Tool(
         name="wiring", fn=wiring, primary="target", risk=RiskLevel.READ,
-        params=(Param("target", required=True, description="FQCN or event name"),
-                Param("aspect", description="plugins | preference | observers"),
+        params=(Param("target", required=True,
+                      description="FQCN, event name, 'GET /V1/...', 'Query.field', x.phtml, or table"),
+                Param("aspect", description="plugins | preference | observers | route | "
+                                            "graphql | template | table"),
                 Param("area", description="frontend | adminhtml | webapi_rest | global")),
-        description="EXACT Magento wiring facts from di.xml/events.xml: which plugins intercept "
-                    "a class (with sortOrder/area/disabled), which preference rewrites it, which "
-                    "observers listen to an event and where it is dispatched. Use BEFORE grep for "
-                    "any 'what intercepts/listens/rewrites/handles' question. "
-                    "Input: a FQCN or event name, or {\"target\": ..., \"aspect\": \"plugins\"}.",
+        description="EXACT Magento wiring facts from the config graph: plugins on a class "
+                    "(sortOrder/area/disabled), the preference that rewrites it, observers of an "
+                    "event + dispatch sites, which service handles a REST route ('GET /V1/...'), "
+                    "the resolver behind 'Query.field', which blocks/view-models render a .phtml, "
+                    "and a table's owner/columns/foreign keys. Use BEFORE grep for any 'what "
+                    "intercepts/listens/handles/renders' question.",
     ),
     Tool(
         name="impact", fn=impact, primary="fqcn", risk=RiskLevel.READ,

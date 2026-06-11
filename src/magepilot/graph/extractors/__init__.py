@@ -1,16 +1,31 @@
 """Extractor registry: classify a file path → (ftype, area), and dispatch extraction.
 
 Area detection is path-rule ONLY (never inferred): etc/<area>/*.xml → that area,
-etc/*.xml → global. Wrong-area answers are worse than grep, so the rule stays dumb.
+etc/*.xml → global; layout files take the view/<area>/ they live in. Wrong-area answers
+are worse than grep, so the rule stays dumb.
 """
 import re
 
-from magepilot.graph.extractors import di, events, module, php
+from magepilot.graph.extractors import (
+    db_schema, di, events, graphqls, jobs, layout, module, php, theme, webapi,
+)
 
 _AREA_RE = re.compile(
-    r"(?:^|/)etc/(?:(adminhtml|frontend|webapi_rest|webapi_soap|graphql|crontab|cron)/)?[^/]+\.xml$")
+    r"(?:^|/)etc/(?:(adminhtml|frontend|webapi_rest|webapi_soap|graphql|crontab|cron)/)?([^/]+\.xml)$")
+_LAYOUT_RE = re.compile(r"(?:^|/)view/(frontend|adminhtml|base)/layout/[^/]+\.xml$")
 
 AREAS = ("global", "frontend", "adminhtml", "webapi_rest", "webapi_soap", "graphql", "crontab")
+
+_ETC_XML = {
+    "di.xml": "di",
+    "events.xml": "events",
+    "webapi.xml": "webapi",
+    "db_schema.xml": "db_schema",
+    "crontab.xml": "jobs",
+    "mview.xml": "jobs",
+    "indexer.xml": "jobs",
+    "queue_consumer.xml": "jobs",
+}
 
 
 def classify(rel: str) -> tuple[str | None, str | None]:
@@ -19,15 +34,18 @@ def classify(rel: str) -> tuple[str | None, str | None]:
         return "registration", None
     m = _AREA_RE.search(rel)
     if m:
-        area = m.group(1) or "global"
-        base = rel.rsplit("/", 1)[-1]
-        if base == "di.xml":
-            return "di", area
-        if base == "events.xml":
-            return "events", area
+        area, base = m.group(1) or "global", m.group(2)
         if base == "module.xml" and area == "global":
             return "module", None
-        return None, None
+        ftype = _ETC_XML.get(base)
+        return (ftype, area) if ftype else (None, None)
+    m = _LAYOUT_RE.search(rel)
+    if m:
+        return "layout", m.group(1) if m.group(1) != "base" else "global"
+    if rel.endswith("/theme.xml") and "/etc/" not in rel:
+        return "theme", None
+    if rel.endswith(".graphqls"):
+        return "graphqls", "graphql"
     if rel.endswith(".php"):
         return "php", None
     return None, None
@@ -39,4 +57,10 @@ EXTRACTORS = {
     "di": di.extract,
     "events": events.extract,
     "module": module.extract,
+    "webapi": webapi.extract,
+    "db_schema": db_schema.extract,
+    "jobs": jobs.extract,
+    "layout": layout.extract,
+    "theme": theme.extract,
+    "graphqls": graphqls.extract,
 }

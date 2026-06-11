@@ -22,6 +22,9 @@ SKIP_DIRS = {".git", ".idea", ".github", "node_modules", "generated", "var", "pu
              "dev", "setup", "Test", "tests", "Fixture", "_files", "__pycache__"}
 TXN_FILES = 200
 MAX_FILE_BYTES = 1024 * 1024
+# Bump when ANY extractor's output semantics change: existing graphs re-extract fully
+# on the next build (file hashes can't see code changes).
+EXTRACTOR_VERSION = "2"
 
 
 def _sha1(path: str) -> str:
@@ -80,6 +83,17 @@ def build(root: str, *, vendor: bool = True, verbose: bool = True) -> dict:
     store = GraphStore(graph_path(root))
     t0 = time.monotonic()
     store.set_meta("root", root)
+    if store.get_meta("extractor_version") != EXTRACTOR_VERSION:
+        # Extractor code changed since this graph was built — re-extract everything.
+        # Wipe content wholesale: per-file deletes against a full FTS index are ~30x
+        # slower than rebuilding into empty tables (FTS5 segment churn).
+        store.db.execute("DELETE FROM edges")
+        store.db.execute("DELETE FROM node_fts")
+        store.db.execute("DELETE FROM nodes")
+        store.db.execute("UPDATE files SET status='pending'")
+        store.set_meta("extractor_version", EXTRACTOR_VERSION)
+        store.set_meta("last_complete", "0")
+        store.db.commit()
     store.set_meta("build_state", "discovering")
 
     # ---- discovery: stat fast-path, hash only changed files

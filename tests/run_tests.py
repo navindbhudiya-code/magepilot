@@ -57,7 +57,7 @@ def assert_true(cond, msg=""):
 
 def assert_in(needle, hay, msg=""):
     if needle not in hay:
-        raise AssertionError(msg or f"expected '{needle}' in: {hay[:200]!r}")
+        raise AssertionError(msg or f"expected '{needle}' in: {repr(hay)[:300]}")
 
 
 def assert_raises(exc, fn, *a, **k):
@@ -629,11 +629,19 @@ def _():
         r.cfg.strict_models = False
 
 
-@test("cloud provider types raise a clear not-implemented error (Phase 6)")
+@test("cloud providers refuse to run without their API key (privacy + clarity)")
 def _():
-    assert_raises(llm_providers.ProviderError, llm_providers.chat,
-                  ProviderCfg(name="anthropic", type="anthropic"), "claude-x",
-                  [{"role": "user", "content": "hi"}])
+    saved = os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        assert_raises(llm_providers.ProviderError, llm_providers.chat,
+                      ProviderCfg(name="anthropic", type="anthropic"), "claude-x",
+                      [{"role": "user", "content": "hi"}])
+        assert_raises(llm_providers.ProviderError, llm_providers.chat,
+                      ProviderCfg(name="openai", type="openai"), "gpt-x",
+                      [{"role": "user", "content": "hi"}])
+    finally:
+        if saved is not None:
+            os.environ["ANTHROPIC_API_KEY"] = saved
 
 
 # ================================================================== Phase 2: orchestrator
@@ -1361,6 +1369,331 @@ def _():
     assert_true(run.status == "done" and run.plan[1].status == "done",
                 f"{run.status} / {run.plan[1].status} — the interrupted task must actually run")
     shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== Phase 5
+from magepilot.agent import modes                                     # noqa: E402
+from magepilot.graph.extractors import classify as classify_path     # noqa: E402
+from magepilot.testgen import phpunit as testgen                      # noqa: E402
+from magepilot.tools.hybridsearch import search as hybrid_search      # noqa: E402
+
+
+@test("modes: subsets filter the catalog, no-edit modes never plan file changes")
+def _():
+    assert_true(modes.get(None).name == "code" and modes.get("nope").name == "code")
+    ask = modes.get("ask")
+    cat = tools.REGISTRY.catalog(names=ask.tools)
+    assert_in("- symbol:", cat)
+    assert_true("sql_query" not in cat and "git_blame" not in cat,
+                "ask mode must show a focused subset")
+    assert_in("sql_query", tools.REGISTRY.catalog(names=modes.get("debug").tools))
+    lim = modes.apply_limits(modes.get("autonomous"), LimitsCfg())
+    assert_true(lim.max_total_steps == 60 and lim.wall_clock_minutes == 45)
+    name, tasks = planner.plan("create a Vendor_Faq module with an admin grid", mode="ask")
+    assert_true(len(tasks) == 1 and tasks[0].kind == "investigate",
+                "ask mode must never plan edits, even for buildish objectives")
+
+
+@test("graph v2: classify routes every new artifact type with the right area")
+def _():
+    assert_true(classify_path("etc/webapi.xml") == ("webapi", "global"))
+    assert_true(classify_path("etc/db_schema.xml") == ("db_schema", "global"))
+    assert_true(classify_path("etc/crontab.xml") == ("jobs", "global"))
+    assert_true(classify_path("etc/adminhtml/di.xml") == ("di", "adminhtml"))
+    assert_true(classify_path("view/frontend/layout/faq_index_index.xml") == ("layout", "frontend"))
+    assert_true(classify_path("view/base/layout/default.xml") == ("layout", "global"))
+    assert_true(classify_path("app/design/frontend/V/t/theme.xml") == ("theme", None))
+    assert_true(classify_path("etc/schema.graphqls") == ("graphqls", "graphql"))
+    assert_true(classify_path("etc/view.xml") == (None, None), "unknown etc xml is skipped")
+
+
+@test("graph v2: routes, tables, cron, layout, and GraphQL all land in the graph")
+def _():
+    build_graph(ROOT, verbose=False)
+    g = get_graph(ROOT)
+    try:
+        kinds = {r["kind"] for r in g.db.execute("SELECT DISTINCT kind FROM nodes")}
+        for k in ("route", "table", "cron_job", "layout_handle", "template",
+                  "gql_type", "gql_field"):
+            assert_in(k, kinds)
+        edges = {r["kind"] for r in g.db.execute("SELECT DISTINCT kind FROM edges")}
+        for k in ("ROUTES_TO", "OWNS_TABLE", "REFERENCES_TABLE", "CRON_RUNS",
+                  "HAS_BLOCK", "RENDERS", "ARG_VIEW_MODEL", "INCLUDES_HANDLE", "RESOLVES"):
+            assert_in(k, edges)
+    finally:
+        g.close()
+
+
+@test("graph v2: what_handles_route matches :param patterns and finds the preference impl")
+def _():
+    g = get_graph(ROOT)
+    try:
+        info = gq.what_handles_route(g, "GET", "/V1/faq/42")
+        assert_true(info is not None, "the :id pattern must match a concrete id")
+        assert_true(info["service"] == "Vendor\\Faq\\Api\\FaqRepositoryInterface::getById", str(info))
+        assert_true(info["impl"] == "Vendor\\Faq\\Model\\FaqRepository",
+                    "the winning preference must be resolved")
+        assert_in("Vendor_Faq::faq_view", info["resources"])
+        assert_true(info["plugins"] >= 1, "BrokenPlugin intercepts the impl")
+        assert_true(gq.what_handles_route(g, "POST", "/V1/faq/42") is None, "wrong verb")
+    finally:
+        g.close()
+
+
+@test("graph v2: graphql_resolver, template_context, table_info answer exactly")
+def _():
+    g = get_graph(ROOT)
+    try:
+        r = gq.graphql_resolver(g, "Query.faq")
+        assert_true(r and r["resolver"] == "Vendor\\Faq\\Model\\Resolver\\Faq", str(r))
+        ctx = gq.template_context(g, "Vendor_Faq::faq/list.phtml")
+        assert_true(ctx["blocks"] and ctx["blocks"][0]["block"] == "Vendor\\Faq\\Block\\FaqList", str(ctx))
+        assert_in("faq_index_index", ctx["handles"])
+        assert_true(any(v["class"] == "Vendor\\Faq\\ViewModel\\FaqData" for v in ctx["view_models"]),
+                    str(ctx["view_models"]))
+        t = gq.table_info(g, "vendor_faq")
+        assert_true(t and t["owner"] == "Vendor_Faq" and "question" in t["columns"], str(t))
+        assert_true(any(ref == "store" for ref, _ in t["fks_out"]), str(t["fks_out"]))
+        cron = g.db.execute("SELECT dst_qname FROM edges WHERE kind='CRON_RUNS'").fetchone()
+        assert_true(cron["dst_qname"] == "Vendor\\Faq\\Cron\\Cleanup::execute")
+    finally:
+        g.close()
+
+
+@test("wiring tool auto-detects routes, GraphQL fields, templates, and tables")
+def _():
+    assert_in("FaqRepositoryInterface::getById", tools.run_tool(ROOT, "wiring", "GET /V1/faq/42"))
+    assert_in("Resolver\\Faq", tools.run_tool(ROOT, "wiring", "Query.faq"))
+    assert_in("FaqList", tools.run_tool(ROOT, "wiring", "Vendor_Faq::faq/list.phtml"))
+    out = tools.run_tool(ROOT, "wiring", '{"target": "vendor_faq", "aspect": "table"}')
+    assert_in("owner=Vendor_Faq", out)
+
+
+@test("hybrid search routes by shape: graph / grep / semantic, sources labeled")
+def _():
+    assert_in("[graph]", hybrid_search(ROOT, "Vendor\\Faq\\Model\\FaqRepository"))
+    assert_in("[graph]", hybrid_search(ROOT, "faq_save_after"))
+    out = hybrid_search(ROOT, "GET /V1/faq/42")
+    assert_in("FaqRepositoryInterface", out)
+    assert_in("[grep]", hybrid_search(ROOT, r"class\s+AddSurcharge"))
+    out = hybrid_search(ROOT, "repository method that throws a not-found exception")
+    assert_in("[semantic]", out)
+    assert_in("FaqRepository.php", out)
+
+
+@test("testgen: graph-powered skeleton mirrors the path, mocks ctor deps, lints clean")
+def _():
+    rel, content = testgen.skeleton(ROOT, "Vendor\\Faq\\Model\\FaqRepository")
+    assert_true(rel == "app/code/Vendor/Faq/Test/Unit/Model/FaqRepositoryTest.php", rel)
+    assert_in("namespace Vendor\\Faq\\Test\\Unit\\Model;", content)
+    assert_in("$this->createMock(CollectionFactory::class)", content)
+    assert_in("new FaqRepository($this->collectionFactory)", content)
+    assert_in("public function testInstance(): void", content)
+    assert_in("markTestIncomplete('TODO: cover FaqRepository::getById()')", content)
+    if shutil.which("php"):
+        d = tempfile.mkdtemp(prefix="magepilot-tg-")
+        p = os.path.join(d, "T.php")
+        open(p, "w").write(content)
+        r = _sp.run(["php", "-l", p], capture_output=True, text=True)
+        assert_true(r.returncode == 0, f"php -l must pass: {r.stdout}{r.stderr}")
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("testgen: write_test writes with approval + journal; undo reverts it")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-tgw-")
+    shutil.copytree(ROOT, os.path.join(d, "app", "code", "Vendor", "Faq"))
+    build_graph(d, verbose=False)
+    res = testgen.write_test(d, "Vendor\\Faq\\Model\\FaqRepository", auto=True, fill=False)
+    assert_true(res["written"] and os.path.isfile(os.path.join(d, res["path"])), str(res))
+    assert_in("Test/Unit/Model/FaqRepositoryTest.php", res["path"])
+    edits.undo(d)
+    assert_true(not os.path.exists(os.path.join(d, res["path"])), "undo must revert the test")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("policy: vendor/bin/phpunit is ASK-tier, runnable only when present, injection-safe")
+def _():
+    assert_true(actions.classify("vendor/bin/phpunit app/code") == "ask")
+    assert_true(actions.classify("vendor/bin/phpunit; rm -rf /") == "blocked")
+    assert_true(actions.classify("vendor/bin/other-binary") == "blocked")
+    r = actions.execute(ROOT, "vendor/bin/phpunit app/code", approver=lambda c, s: "yes")
+    assert_true(r["ran"] is False and "not found" in r["reason"],
+                f"missing phpunit must fail gracefully: {r}")
+
+
+@test("planner: 'write tests for X' plans the test template, not a module scaffold")
+def _():
+    name, tasks = planner.plan("write unit tests for the FaqRepository class")
+    assert_true(name == "create_tests", f"got {name}")
+    assert_true([t.kind for t in tasks] == ["investigate", "edit", "command"])
+    assert_true(tasks[2].command.startswith("vendor/bin/phpunit"))
+    name2, _tasks2 = planner.plan("create a Vendor_Blog module")
+    assert_true(name2 == "create_module", "plain module creation is unaffected")
+
+
+@test("regression: testgen rejects a model fill that doesn't parse as PHP")
+def _():
+    if not shutil.which("php"):
+        return
+    broken = ("<?php\nclass FaqRepositoryTest extends TestCase {\n"
+              "    protected function setUp(): void {}\n"
+              "    public function testX(): void { $this loads the FAQ; }\n}\n")
+    class FakeRouter:
+        def complete(self, *a, **k):
+            return broken
+    orig = testgen.get_router
+    testgen.get_router = lambda: FakeRouter()
+    try:
+        rel, content = testgen.generate(ROOT, "Vendor\\Faq\\Model\\FaqRepository", fill=True)
+    finally:
+        testgen.get_router = orig
+    assert_true("$this loads the FAQ" not in content,
+                "an unparseable fill must be rejected")
+    assert_in("markTestIncomplete", content, "fallback must be the deterministic skeleton")
+
+
+@test("theme extractor: parent chain lands as THEME_PARENT")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-theme-")
+    tdir = os.path.join(d, "app", "design", "frontend", "Vendor", "demo")
+    os.makedirs(tdir)
+    open(os.path.join(tdir, "theme.xml"), "w").write(
+        '<theme xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        "<title>Demo</title><parent>Hyva/default</parent></theme>")
+    open(os.path.join(tdir, "registration.php"), "w").write("<?php // theme")
+    build_graph(d, verbose=False)
+    g = get_graph(d)
+    try:
+        e = g.db.execute("SELECT * FROM edges WHERE kind='THEME_PARENT'").fetchone()
+        assert_true(e is not None and e["src_qname"] == "theme:Vendor/demo"
+                    and e["dst_qname"] == "theme:Hyva/default",
+                    str(dict(e) if e else None))
+    finally:
+        g.close()
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== Phase 6: MCP + cloud
+from magepilot.config.schema import McpServerCfg                      # noqa: E402
+from magepilot.mcp import client as mcp_client, server as mcp_server  # noqa: E402
+from magepilot.tools.registry import ToolRegistry as _TR              # noqa: E402
+
+
+@test("anthropic payload builder: system extracted, sampling filtered, stops kept")
+def _():
+    prov = ProviderCfg(name="anthropic", type="anthropic")
+    url, headers, body = llm_providers.anthropic_request(
+        prov, "claude-sonnet-4-5",
+        [{"role": "system", "content": "be terse"}, {"role": "user", "content": "hi"}],
+        stop=["Observation:", "<|im_end|>"],
+        sampling={"temperature": 0.15, "repetition_penalty": 1.1, "max_tokens": 900},
+        api_key="k-test")
+    assert_true(url.endswith("/v1/messages"))
+    assert_true(headers["x-api-key"] == "k-test" and "anthropic-version" in headers)
+    assert_true(body["system"] == "be terse")
+    assert_true(all(m["role"] != "system" for m in body["messages"]))
+    assert_true(body["max_tokens"] == 900 and body["temperature"] == 0.15)
+    assert_true("repetition_penalty" not in body, "unsupported keys must be filtered")
+    assert_in("Observation:", body["stop_sequences"])
+    assert_true(llm_providers.parse_anthropic(
+        {"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}) == "ab")
+
+
+@test("config loader parses [mcp_servers.*] declarations")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mcpcfg-")
+    open(os.path.join(d, ".magepilot.toml"), "w").write(
+        '[mcp_servers.ctx7]\ncommand = "npx"\nargs = ["-y", "ctx7-mcp"]\nread_only = true\n')
+    orig = config_loader.USER_CONFIG
+    config_loader.USER_CONFIG = os.path.join(d, "nonexistent.toml")
+    try:
+        cfg = config_loader.load(d)
+    finally:
+        config_loader.USER_CONFIG = orig
+    assert_true("ctx7" in cfg.mcp_servers)
+    m = cfg.mcp_servers["ctx7"]
+    assert_true(m.command == "npx" and m.args == ("-y", "ctx7-mcp") and m.read_only)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("MCP server handle(): init, read-only listing, calls, errors, notifications")
+def _():
+    ctx = ToolContext(root=ROOT)
+    r = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"}, ctx, False)
+    assert_true(r["result"]["serverInfo"]["name"] == "magepilot")
+    assert_true(mcp_server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"},
+                                  ctx, False) is None)
+    tools_ro = {t["name"] for t in mcp_server.handle(
+        {"id": 2, "method": "tools/list"}, ctx, False)["result"]["tools"]}
+    assert_in("grep", tools_ro)
+    assert_in("wiring", tools_ro)
+    assert_true("write_file" not in tools_ro, "writes hidden without --allow-writes")
+    tools_rw = {t["name"] for t in mcp_server.handle(
+        {"id": 3, "method": "tools/list"}, ctx, True)["result"]["tools"]}
+    assert_in("write_file", tools_rw)
+    r = mcp_server.handle({"id": 4, "method": "tools/call",
+                           "params": {"name": "grep",
+                                      "arguments": {"pattern": "NoSuchEntityException"}}},
+                          ctx, False)
+    assert_in("FaqRepository.php", r["result"]["content"][0]["text"])
+    assert_true(not r["result"]["isError"])
+    r = mcp_server.handle({"id": 5, "method": "tools/call",
+                           "params": {"name": "write_file",
+                                      "arguments": {"path": "x.php", "content": "x"}}},
+                          ctx, False)
+    assert_true(r["result"]["isError"], "write tools must refuse without --allow-writes")
+    r = mcp_server.handle({"id": 6, "method": "no/such"}, ctx, False)
+    assert_true(r["error"]["code"] == -32601)
+
+
+@test("MCP loopback: our client drives our server over real stdio (the acceptance)")
+def _():
+    import sys as _sys
+    cfg = McpServerCfg(name="magepilot_self", command=_sys.executable,
+                       args=("-m", "magepilot", "mcp-serve", "--root", ROOT))
+    srv = mcp_client.McpServer(cfg)
+    try:
+        srv.initialize()
+        specs = srv.list_tools()
+        names = {t["name"] for t in specs}
+        assert_in("grep", names)
+        assert_in("symbol", names)
+        assert_true("write_file" not in names)
+        grep_spec = next(t for t in specs if t["name"] == "grep")
+        assert_true(grep_spec["inputSchema"]["properties"]["pattern"]["type"] == "string")
+        out = srv.call("grep", {"pattern": "class AddSurcharge"})
+        assert_in("AddSurcharge", out)
+        out = srv.call("magento_logs", {"log": "../etc/passwd"})
+        assert_in("error", out)
+    finally:
+        srv.close()
+
+
+@test("MCP client: wrapped tools default to MUTATE and pass the approval gate")
+def _():
+    class FakeSrv:
+        cfg = McpServerCfg(name="ext", command="x", read_only=False)
+        def call(self, name, arguments):
+            return f"called {name} with {arguments.get('q')}"
+    spec = {"name": "lookup", "description": "find things",
+            "inputSchema": {"type": "object",
+                            "properties": {"q": {"type": "string", "description": "query"}},
+                            "required": ["q"]}}
+    reg = _TR()
+    tool = mcp_client.wrap_tool(FakeSrv(), spec, set())
+    reg.register(tool)
+    assert_true(tool.risk is RiskLevel.MUTATE, "external tools are approval-gated by default")
+    assert_in("[ext]", tool.description)
+    out = reg.dispatch(ToolContext(root="."), "lookup", '{"q": "x"}')
+    assert_in("requires approval", out)
+    out = reg.dispatch(ToolContext(root=".", approver=lambda t, a: "yes"), "lookup", '{"q": "x"}')
+    assert_true(out == "called lookup with x", out)
+    ro = mcp_client.wrap_tool(
+        FakeSrv.__class__("F", (), {"cfg": McpServerCfg(name="ext", command="x", read_only=True),
+                                    "call": lambda self, n, a: "ok"})(), spec, {"lookup"})
+    assert_true(ro.risk is RiskLevel.READ and ro.name == "ext_lookup",
+                f"read_only + collision prefix: {ro.name} {ro.risk}")
 
 
 def main() -> int:

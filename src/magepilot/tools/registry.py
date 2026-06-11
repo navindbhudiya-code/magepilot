@@ -29,16 +29,17 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
-    def catalog(self, mode: str | None = None, include_mutating: bool = False) -> str:
+    def catalog(self, names: tuple | None = None, include_mutating: bool = False) -> str:
         """Human-readable tool list for the system prompt (v1 tool_catalog format).
 
-        READ-only by default: the ReAct executor's prompt stays exactly the v1 catalog
-        even though MUTATE write tools are registered — investigate/verify tasks must
-        not be offered writes. (`mode` adds finer filtering in Phase 5.)
+        READ-only by default: investigate/verify tasks must not be offered writes.
+        `names` is a mode's visible-tool subset — with ~20 READ tools registered,
+        focus is what keeps a 7B routing well. Unknown names are ignored.
         """
         return "\n".join(
             f"- {t.name}: {t.description}" for t in self._tools.values()
-            if include_mutating or t.risk is RiskLevel.READ)
+            if (include_mutating or t.risk is RiskLevel.READ)
+            and (names is None or t.name in names))
 
     def dispatch(self, ctx: ToolContext, name: str, arg: str) -> str:
         """Run one tool call. `arg` is the raw Action Input (JSON object or plain string)."""

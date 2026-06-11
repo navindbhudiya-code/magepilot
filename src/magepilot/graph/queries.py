@@ -265,6 +265,136 @@ def impact_of(store, fqcn: str) -> dict:
     return out
 
 
+# ------------------------------------------------------------------ v2: REST routes
+def what_handles_route(store, http: str, path: str) -> dict | None:
+    """Match a concrete URL against webapi route patterns (':param' wildcards win last).
+    Returns {route, service, resources, declared_in, impl, plugins} or None."""
+    db = store.db
+    http = (http or "GET").strip().upper()
+    want = [s for s in (path or "").strip().strip("/").split("/") if s]
+    best = None
+    for e in db.execute("SELECT * FROM edges WHERE kind='ROUTES_TO' AND src_qname LIKE ?",
+                        (f"route:{http} %",)):
+        pattern = e["src_qname"].split(" ", 1)[1]
+        segs = [s for s in pattern.strip("/").split("/") if s]
+        if len(segs) != len(want):
+            continue
+        literals = 0
+        for s, w in zip(segs, want):
+            if s.startswith(":"):
+                continue
+            if s.lower() != w.lower():
+                break
+            literals += 1
+        else:
+            if best is None or literals > best[0]:
+                best = (literals, e, pattern)
+    if best is None:
+        return None
+    _, e, pattern = best
+    attrs = json.loads(e["attrs"] or "{}")
+    svc = e["dst_qname"]
+    cls = svc.split("::")[0]
+    prefs = preference_for(store, cls)
+    impl = next((p["impl"] for p in prefs if p.get("winner")), None)
+    return {"route": f"{http} {pattern}", "service": svc,
+            "resources": attrs.get("resources", []),
+            "declared_in": _loc(db, e["file_id"], e["line"]),
+            "impl": impl,
+            "plugins": len(plugins_for(store, impl or cls))}
+
+
+# ------------------------------------------------------------------ v2: GraphQL
+def graphql_resolver(store, type_field: str) -> dict | None:
+    """'Query.products' (or just a field name) → its resolver class."""
+    db = store.db
+    q = (type_field or "").strip()
+    qname = q if q.startswith("gql:") else "gql:" + q
+    row = db.execute("SELECT * FROM edges WHERE kind='RESOLVES' AND src_qname=?",
+                     (qname,)).fetchone()
+    if row is None and "." not in q:                     # bare field name — search
+        row = db.execute("SELECT * FROM edges WHERE kind='RESOLVES' AND src_qname LIKE ?",
+                         ("gql:%." + q,)).fetchone()
+    if row is None:
+        return None
+    resolver = class_info(store, row["dst_qname"])
+    return {"field": row["src_qname"][len("gql:"):], "resolver": row["dst_qname"],
+            "declared_in": _loc(db, row["file_id"], row["line"]),
+            "resolver_file": resolver.ref.file if resolver else ""}
+
+
+# ------------------------------------------------------------------ v2: templates
+def template_context(store, template: str) -> dict:
+    """Where a template's data comes from: rendering blocks, their layout handles,
+    and the view models passed to them."""
+    db = store.db
+    t = (template or "").strip()
+    like = "%" + t.lstrip("tpl:") + "%"
+    renders = db.execute(
+        "SELECT * FROM edges WHERE kind='RENDERS' AND dst_qname LIKE ?", (like,)).fetchall()
+    blocks, handles, view_models = [], set(), []
+    for r in renders:
+        attrs = json.loads(r["attrs"] or "{}")
+        blocks.append({"block": r["src_qname"], "handle": attrs.get("handle", ""),
+                       "block_name": attrs.get("block_name", ""), "area": r["area"],
+                       "declared_in": _loc(db, r["file_id"], r["line"])})
+        if attrs.get("handle"):
+            handles.add(attrs["handle"])
+        for vm in db.execute("SELECT * FROM edges WHERE kind='ARG_VIEW_MODEL' "
+                             "AND src_qname=?", (r["src_qname"],)):
+            va = json.loads(vm["attrs"] or "{}")
+            view_models.append({"class": vm["dst_qname"], "arg": va.get("arg_name", "")})
+    return {"template": t, "blocks": blocks[:CAP], "handles": sorted(handles),
+            "view_models": view_models[:CAP]}
+
+
+# ------------------------------------------------------------------ v2: tables
+def table_info(store, table: str) -> dict | None:
+    db = store.db
+    name = (table or "").strip().removeprefix("table:")
+    row = db.execute("SELECT * FROM nodes WHERE kind='table' AND qname=?",
+                     ("table:" + name,)).fetchone()
+    if row is None:
+        return None
+    # aggregate the per-module declarations: union of columns, owner = largest declarer
+    decls = db.execute("SELECT src_qname, file_id, attrs FROM edges WHERE "
+                       "kind='OWNS_TABLE' AND dst_qname=?", ("table:" + name,)).fetchall()
+    attrs, owner, best = {}, None, -1
+    columns, extended_by, declared_total = [], [], 0
+    for d in decls:
+        da = json.loads(d["attrs"] or "{}")
+        for c in da.get("columns", []):
+            if c not in columns:
+                columns.append(c)
+        n = da.get("n_columns", 0)
+        declared_total += n
+        extended_by.append((d["src_qname"].removeprefix("module:"), n))
+        if n > best:
+            best, owner, attrs = n, d, {**da}
+    # stored column lists are capped per declaration (context economy) — report the
+    # DECLARED total, show the capped union
+    attrs["columns"] = columns
+    attrs["n_columns"] = max(declared_total, len(columns))
+    extended_by = [m for m, n in sorted(extended_by, key=lambda x: -x[1])[1:] if n]
+    fks_out = [(e["dst_qname"].removeprefix("table:"),
+                json.loads(e["attrs"] or "{}").get("column"))
+               for e in db.execute("SELECT * FROM edges WHERE kind='REFERENCES_TABLE' "
+                                   "AND src_qname=?", ("table:" + name,))]
+    fks_in = [e["src_qname"].removeprefix("table:")
+              for e in db.execute("SELECT src_qname FROM edges WHERE "
+                                  "kind='REFERENCES_TABLE' AND dst_qname=? LIMIT ?",
+                                  ("table:" + name, CAP))]
+    users = [e["src_qname"] for e in db.execute(
+        "SELECT src_qname FROM edges WHERE kind='USES_TABLE' AND dst_qname=? LIMIT ?",
+        ("table:" + name, CAP))]
+    return {"table": name, "engine": attrs.get("engine"),
+            "columns": attrs.get("columns", []), "n_columns": attrs.get("n_columns", 0),
+            "owner": (owner["src_qname"].removeprefix("module:") if owner else None),
+            "declared_in": _loc(db, owner["file_id"]) if owner else "",
+            "extended_by": extended_by[:8],
+            "fks_out": fks_out, "fks_in": fks_in, "used_by": users}
+
+
 # ------------------------------------------------------------------ 7. diagnose_plugin
 def diagnose_plugin(store, plugin_fqcn: str) -> dict:
     """Ordered checks for 'why is my plugin not firing'."""

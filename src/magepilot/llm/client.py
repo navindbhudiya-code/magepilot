@@ -6,7 +6,7 @@ import urllib.request
 
 def complete(base_url: str, model: str, messages: list[dict],
              stop: list[str] | None = None, sampling: dict | None = None,
-             timeout: int = 300) -> str:
+             timeout: int = 300, headers: dict | None = None) -> str:
     """Blocking chat completion. Returns the assistant message content."""
     payload = {"model": model, "messages": messages, **(sampling or {})}
     if stop:
@@ -14,7 +14,7 @@ def complete(base_url: str, model: str, messages: list[dict],
     req = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **(headers or {})},
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)["choices"][0]["message"]["content"]

@@ -23,6 +23,15 @@ class ProviderCfg:
 
 
 @dataclass(frozen=True)
+class McpServerCfg:
+    """One external MCP stdio server: [mcp_servers.<name>] in config.toml."""
+    name: str
+    command: str
+    args: tuple = ()
+    read_only: bool = False    # default MUTATE (approval-gated); opt-in to READ
+
+
+@dataclass(frozen=True)
 class LimitsCfg:
     max_task_steps: int = 10
     max_total_steps: int = 40
@@ -38,3 +47,4 @@ class Config:
     limits: LimitsCfg = field(default_factory=LimitsCfg)
     sampling: dict = field(default_factory=dict)
     strict_models: bool = False            # fail instead of substituting the loaded model
+    mcp_servers: dict[str, McpServerCfg] = field(default_factory=dict)
