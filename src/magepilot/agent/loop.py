@@ -22,6 +22,7 @@ from magepilot import config
 from magepilot.agent import compress, planner, react, state as st
 from magepilot.config.schema import LimitsCfg
 from magepilot.edits.scaffold import run_make
+from magepilot.memory import recall
 from magepilot.safety.policy import classify, execute
 
 CHECKPOINT_EVERY_STEPS = 3
@@ -32,9 +33,14 @@ MAX_TASK_ATTEMPTS = 2
 def start(objective: str, root: str, *, mode: str = "code") -> st.RunState:
     """PLAN: build a new run (template-first; LLM fallback; never fails)."""
     template, tasks = planner.plan(objective)
+    try:
+        memory_block = recall.recall_block(root, objective)
+    except Exception:
+        memory_block = ""              # memory must never block a run
     run = st.RunState(run_id=st.new_run_id(objective), objective=objective,
                       root=os.path.realpath(root), mode=mode, plan=tasks,
-                      template=template, started_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+                      template=template, memory_block=memory_block,
+                      started_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
     st.save(run)
     st.log_event(run.run_id, "plan", template=template or "(llm)",
                  tasks=[f"[{t.kind}] {t.goal}" for t in tasks])
@@ -142,7 +148,10 @@ def _execute(run, task, *, limits, approver, asker, auto, cancel,
 
 
 def _addendum(run, task) -> str:
-    parts = [f"Current task ({task.kind}): {task.goal}"]
+    parts = []
+    if run.memory_block:
+        parts.append(run.memory_block)
+    parts.append(f"Current task ({task.kind}): {task.goal}")
     if task.done_when:
         parts.append(f"This task is done when: {task.done_when}")
     notes = run.notes_block()
@@ -194,6 +203,9 @@ def _execute_edit(run, task, *, approver, asker, auto, verbose) -> tuple[bool, s
     out = (("applied: " + ", ".join(applied)) if applied else "no changes applied")
     if skipped:
         out += "; skipped: " + ", ".join(skipped)
+    for b in res.get("blocked", []):
+        # the lint feedback the model needs to regenerate compliant code on retry
+        out += f"; BLOCKED {b['path']}: " + "; ".join(b["reasons"])
     return bool(applied), out, False
 
 
@@ -232,6 +244,10 @@ def _finish(run: st.RunState, status: str, verbose: bool) -> st.RunState:
     run.status = status
     if status != "paused":
         run.answer = compress.summarize_run(run.objective, run)
+        try:
+            recall.extract_facts(run.root, run)    # the run's notes become project memory
+        except Exception:
+            pass                                   # memory must never fail a finish
     st.save(run)
     st.log_event(run.run_id, "finish", status=status)
     if verbose:

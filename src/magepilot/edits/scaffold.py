@@ -9,6 +9,7 @@ from magepilot.edits.apply import _reverse_for, _save_journal, apply as _apply_o
 from magepilot.edits.blocks import parse_plan
 from magepilot.errors import ToolError
 from magepilot.llm.router import get_router
+from magepilot.safety import scan as safety_scan
 from magepilot.safety.sandbox import _resolve_file
 from magepilot.ui.progress import Spinner
 
@@ -116,10 +117,23 @@ def run_make(task: str, root: str, approver=None, asker=None,
         return {"applied": [], "skipped": []}
 
     print(f"\nProposed {len(ops)} change(s) in {root}:\n")
-    applied, skipped, reverses = [], [], []
+    applied, skipped, blocked_ops, reverses = [], [], [], []
     approve_all = auto
     for op in ops:
-        print(preview(root, op) + "\n")
+        # pre-write scan BEFORE the approval prompt — findings appear with the preview;
+        # BLOCK-tier findings refuse the op even in full-auto mode
+        findings = safety_scan.scan_op(op)
+        print(preview(root, op))
+        for f in findings:
+            print("   " + f.render())
+        print()
+        blocks = safety_scan.blocked(findings)
+        if blocks:
+            print("   ↳ ⛔ refused by policy\n")
+            blocked_ops.append({"path": op.get("path", ""),
+                                "reasons": [f"{f.rule_id}: {f.message}" for f in blocks]})
+            skipped.append(op)
+            continue
         if plan_only:
             continue
         ok = approve_all
@@ -161,4 +175,4 @@ def run_make(task: str, root: str, approver=None, asker=None,
                         print(f"   (exit {res['exit']})\n{out}")
                     else:
                         print(f"   skipped — {res['reason']}")
-    return {"applied": applied, "skipped": skipped}
+    return {"applied": applied, "skipped": skipped, "blocked": blocked_ops}

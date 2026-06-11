@@ -13,6 +13,7 @@ import os
 
 from magepilot import config
 from magepilot.edits.apply import _reverse_for, apply as _apply_op
+from magepilot.safety import scan as _scan
 from magepilot.tools.base import Param, RiskLevel, Tool, ToolContext
 
 
@@ -37,6 +38,11 @@ def _record_undo(root: str, reverse: dict | None) -> None:
 
 
 def _do(ctx: ToolContext, op: dict) -> str:
+    blocks = _scan.blocked(_scan.scan_op(op))
+    if blocks:
+        return ("error: refused by policy — "
+                + "; ".join(f"{f.rule_id}: {f.message}" for f in blocks)
+                + ". Fix the content and try again.")
     reverse = _reverse_for(ctx.root, op)
     out = _apply_op(ctx.root, op)
     if not out.startswith(("skipped", "unknown")):

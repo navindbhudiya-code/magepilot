@@ -198,7 +198,7 @@ case "$cmd" in
   stop)               cmd_stop "$@" ;;
   status)             cmd_status "$@" ;;
   ask)                cmd_ask "$@" ;;
-  index|run|suggest|watch|sql|make|undo|do|resume|runs) cmd_agent "$cmd" "$@" ;;
+  index|run|suggest|watch|sql|make|undo|do|resume|runs|graph|review) cmd_agent "$cmd" "$@" ;;
   help|-h|--help)     usage ;;
   *)                  warn "unknown command: $cmd"; echo; usage; exit 1 ;;
 esac

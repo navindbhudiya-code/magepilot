@@ -6,4 +6,7 @@
     <type name="Magento\Catalog\Model\Product">
         <plugin name="vendor_faq_add_surcharge" type="Vendor\Faq\Plugin\AddSurcharge" sortOrder="10"/>
     </type>
+    <type name="Vendor\Faq\Model\FaqRepository">
+        <plugin name="vendor_faq_broken" type="Vendor\Faq\Plugin\BrokenPlugin" sortOrder="20"/>
+    </type>
 </config>

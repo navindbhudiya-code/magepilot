@@ -875,6 +875,304 @@ def _():
     shutil.rmtree(d, ignore_errors=True)
 
 
+# ================================================================== Phase 3: knowledge graph
+from magepilot.graph import queries as gq                             # noqa: E402
+from magepilot.graph.build import build as build_graph                # noqa: E402
+from magepilot.graph.store import get_graph, graph_path               # noqa: E402
+from magepilot.memory.store import MemoryStore, project_store         # noqa: E402
+from magepilot.memory import recall as mem_recall                     # noqa: E402
+from magepilot.review import reviewer                                 # noqa: E402
+from magepilot.safety import scan as safety_scan                      # noqa: E402
+from magepilot.safety.lint_magento import lint_content                # noqa: E402
+
+
+@test("graph build: fixture module, classes, and Magento edges all land")
+def _():
+    counts = build_graph(ROOT, verbose=False)
+    assert_true(counts["errors"] == 0, f"parse errors: {counts['errors']}")
+    g = get_graph(ROOT)
+    try:
+        mods = [r["name"] for r in g.db.execute("SELECT name FROM modules")]
+        assert_in("Vendor_Faq", mods)
+        kinds = {r["kind"]: r["n"] for r in g.db.execute(
+            "SELECT kind, COUNT(*) n FROM nodes GROUP BY kind")}
+        assert_true(kinds.get("class", 0) >= 5 and kinds.get("interface", 0) >= 1, str(kinds))
+        edges = {r["kind"] for r in g.db.execute("SELECT DISTINCT kind FROM edges")}
+        for k in ("PREFERS", "PLUGS_INTO", "PLUGS_METHOD", "OBSERVES", "DISPATCHES",
+                  "INJECTS", "IMPLEMENTS", "DI_ARGUMENT", "DEPENDS_ON_MODULE"):
+            assert_in(k, edges)
+        assert_true(g.get_meta("build_state") == "complete")
+    finally:
+        g.close()
+
+
+@test("graph incremental: unchanged rerun touches nothing; edits and deletes propagate")
+def _():
+    c1 = build_graph(ROOT, verbose=False)
+    assert_true(c1["changed"] == 0 and c1["deleted"] == 0,
+                f"no-op rerun must be clean, got {c1['changed']}/{c1['deleted']}")
+    extra = os.path.join(ROOT, "Model", "Tmp.php")
+    open(extra, "w").write("<?php\nnamespace Vendor\\Faq\\Model;\nclass Tmp {}\n")
+    try:
+        c2 = build_graph(ROOT, verbose=False)
+        assert_true(c2["changed"] == 1, f"got {c2['changed']}")
+        g = get_graph(ROOT)
+        assert_true(g.db.execute("SELECT 1 FROM nodes WHERE qname='Vendor\\Faq\\Model\\Tmp'")
+                    .fetchone() is not None)
+        g.close()
+    finally:
+        os.remove(extra)
+    c3 = build_graph(ROOT, verbose=False)
+    assert_true(c3["deleted"] == 1, f"got {c3['deleted']}")
+    g = get_graph(ROOT)
+    assert_true(g.db.execute("SELECT 1 FROM nodes WHERE qname='Vendor\\Faq\\Model\\Tmp'")
+                .fetchone() is None, "deleted file's nodes must cascade away")
+    g.close()
+
+
+@test("graph: find_symbol + class_info resolve names, parents, and injections")
+def _():
+    g = get_graph(ROOT)
+    try:
+        hits = gq.find_symbol(g, "FaqRepository")
+        assert_true(hits and hits[0].qname == "Vendor\\Faq\\Model\\FaqRepository", str(hits[:2]))
+        info = gq.class_info(g, "Vendor\\Faq\\Model\\FaqRepository")
+        assert_in("Vendor\\Faq\\Api\\FaqRepositoryInterface", info.implements)
+        assert_true(any(t == "Vendor\\Faq\\Model\\ResourceModel\\Faq\\CollectionFactory"
+                        for _, t in info.injects), str(info.injects))
+        assert_in("getById", " ".join(info.methods))
+        # fuzzy: split-word FTS finds the repository from natural phrasing
+        fuzzy = gq.find_symbol(g, "faq repository")
+        assert_true(any("FaqRepository" in r.qname for r in fuzzy), str(fuzzy[:3]))
+    finally:
+        g.close()
+
+
+@test("graph: plugins_for sees the global plugin AND the frontend area disable")
+def _():
+    g = get_graph(ROOT)
+    try:
+        plugs = gq.plugins_for(g, "Magento\\Catalog\\Model\\Product")
+        assert_true(len(plugs) == 1, str(plugs))
+        p = plugs[0]
+        assert_true(p.plugin_fqcn == "Vendor\\Faq\\Plugin\\AddSurcharge")
+        assert_true(p.disabled is True and p.area == "frontend",
+                    f"frontend disable must override global: {p}")
+        # the broken plugin is found on the concrete class, with the method mismatch flagged
+        plugs2 = gq.plugins_for(g, "Vendor\\Faq\\Model\\FaqRepository")
+        assert_true(any(pl.plugin_fqcn.endswith("BrokenPlugin") for pl in plugs2), str(plugs2))
+        broken = next(pl for pl in plugs2 if pl.plugin_fqcn.endswith("BrokenPlugin"))
+        assert_true(any(m[1] == "fetchAll" and m[2] is False for m in broken.methods),
+                    f"mismatch must be flagged: {broken.methods}")
+    finally:
+        g.close()
+
+
+@test("graph: preference, observers + dispatch site, and impact counts are exact")
+def _():
+    g = get_graph(ROOT)
+    try:
+        prefs = gq.preference_for(g, "Vendor\\Faq\\Api\\FaqRepositoryInterface")
+        assert_true(len(prefs) == 1 and prefs[0]["impl"] == "Vendor\\Faq\\Model\\FaqRepository"
+                    and prefs[0]["winner"], str(prefs))
+        obs, disp = gq.observers_of(g, "faq_save_after")
+        assert_true(len(obs) == 1 and obs[0].observer_fqcn == "Vendor\\Faq\\Observer\\InvalidateCache",
+                    str(obs))
+        assert_true(any("FaqManager::save" in d for d in disp),
+                    f"dispatch site must be found: {disp}")
+        imp = gq.impact_of(g, "Vendor\\Faq\\Api\\FaqRepositoryInterface")
+        rels = imp["relations"]
+        assert_true(rels["implementors"]["count"] == 1, str(rels))
+        assert_true(rels["injectors"]["count"] == 1 and
+                    "FaqManager" in rels["injectors"]["examples"][0], str(rels))
+        assert_true(rels["preferences"]["count"] == 1, str(rels))
+    finally:
+        g.close()
+
+
+@test("graph: diagnose_plugin catches method typos and cross-file disables")
+def _():
+    g = get_graph(ROOT)
+    try:
+        d1 = gq.diagnose_plugin(g, "Vendor\\Faq\\Plugin\\BrokenPlugin")
+        assert_true(any("METHOD MISMATCH" in f and "fetchAll" in f for f in d1["findings"]),
+                    str(d1["findings"]))
+        d2 = gq.diagnose_plugin(g, "Vendor\\Faq\\Plugin\\AddSurcharge")
+        assert_true(any("DISABLED ELSEWHERE" in f and "frontend" in f for f in d2["findings"]),
+                    f"the frontend disable must be attributed: {d2['findings']}")
+        d3 = gq.diagnose_plugin(g, "Vendor\\Faq\\Plugin\\Nonexistent")
+        assert_true(any("NOT DECLARED" in f for f in d3["findings"]))
+    finally:
+        g.close()
+
+
+@test("graph tools: registry dispatch answers wiring questions; missing graph degrades")
+def _():
+    out = tools.run_tool(ROOT, "wiring", "Magento\\Catalog\\Model\\Product")
+    assert_in("AddSurcharge", out)
+    assert_in("DISABLED", out)
+    out = tools.run_tool(ROOT, "wiring", '{"target": "faq_save_after", "aspect": "observers"}')
+    assert_in("InvalidateCache", out)
+    out = tools.run_tool(ROOT, "symbol", "FaqManager")
+    assert_in("Vendor\\Faq\\Model\\FaqManager", out)
+    out = tools.run_tool(ROOT, "diagnose_plugin", "Vendor\\Faq\\Plugin\\BrokenPlugin")
+    assert_in("METHOD MISMATCH", out)
+    d = tempfile.mkdtemp(prefix="magepilot-nograph-")
+    assert_in("not built", tools.run_tool(d, "impact", "Some\\Class"))
+    shutil.rmtree(d, ignore_errors=True)
+    # grep's empty-result hint points at the graph once it exists
+    hint = tools.grep(ROOT, "TotallyAbsentSymbolXyz")
+    assert_in("symbol", hint)
+
+
+# ================================================================== Phase 3: memory
+@test("memory store: dedupe, keyword search, touch, and LRU eviction cap")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mem-")
+    m = MemoryStore(os.path.join(d, "memory.db"), cap=5)
+    for i in range(6):
+        m.add(f"filler fact number {i} about nothing")
+    assert_true(m.all_count() <= 5, f"cap must hold, got {m.all_count()}")
+    a = m.add("checkout totals collected in app/code/V/M/Model/Total/Fee.php", source="run-1")
+    assert_true(m.add("checkout totals collected in app/code/V/M/Model/Total/Fee.php") == a,
+                "identical facts must dedupe")
+    hits = m.search("where are checkout totals computed")
+    assert_true(hits and "Total/Fee.php" in hits[0]["content"], str([h['content'] for h in hits]))
+    m.touch([hits[0]["id"]])
+    assert_true(m.db.execute("SELECT uses FROM facts WHERE id=?", (hits[0]["id"],))
+                .fetchone()[0] == 1)
+    m.close()
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("memory: run-end facts persist and the NEXT run recalls them")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mem2-")
+    orig_gen, orig_router = scaffold.generate_plan, compress.get_router
+    scaffold.generate_plan = _stub_module_plan
+    compress.get_router = _no_model
+    try:
+        r1 = loop.start("Create a Vendor_Faq module with an admin grid", d)
+        r1 = loop.run_loop(r1, auto=True, verbose=False, limits=LimitsCfg())
+        assert_true(r1.status == "done")
+        ms = project_store(d)
+        n = ms.all_count()
+        ms.close()
+        assert_true(n >= 1, f"finished run must persist facts, got {n}")
+        r2 = loop.start("extend the Vendor_Faq module with a new admin grid column", d)
+        assert_true(r2.memory_block, "second run must recall first run's facts")
+        assert_in("Known project facts", r2.memory_block)
+    finally:
+        scaffold.generate_plan, compress.get_router = orig_gen, orig_router
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("memory tools: remember saves a project fact; recall_memory finds it")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mem3-")
+    out = tools.run_tool(d, "remember", "the FAQ grid lives in view/adminhtml/ui_component/faq_listing.xml")
+    assert_in("remembered", out)
+    out = tools.run_tool(d, "recall_memory", "where is the faq grid defined")
+    assert_in("faq_listing.xml", out)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== Phase 3: lint + scan
+@test("every MP rule fires on its sample and stays quiet on clean code")
+def _():
+    samples = {
+        "MP001": ("X.php", "<?php $om = \\Magento\\Framework\\App\\ObjectManager::getInstance();"),
+        "MP002": ("X.php", "<?php $id = $_GET['id'];"),
+        "MP003": ("X.php", "<?php exec('ls -la');"),
+        "MP004": ("X.php", "<?php $data = unserialize($raw);"),
+        "MP005": ("X.php", "<?php $conn->query(\"SELECT * FROM t WHERE id=\" . $id);"),
+        "MP006": ("Config.php", "<?php $apiKey = 'sk_live_abcDEF123456789xyz';"),
+        "MP008": ("etc/di.xml", "<config><preference for=\"A\" type=\"B\"/></config>"),
+        "MP009": ("view.phtml", "<p><?= $block->getName(); ?></p>"),
+        "MP010": ("X.php", "<?php foreach ($ids as $id) { $p = $factory->create()->load($id); }"),
+        "MP011": ("Patch.php", "<?php $sql = 'CREATE TABLE vendor_faq (id INT)';"),
+        "MP012": ("view.phtml", "<script>el.innerHTML = userContent;</script>"),
+        "MP013": ("X.php", "<?php die('boom');"),
+        "MP014": ("X.php", "<?php $ch = curl_init($url);"),
+        "MP015": ("X.php", "<?php\nnamespace V\\M;\nclass X {}"),
+    }
+    for rule_id, (path, content) in samples.items():
+        ids = [f.rule_id for f in lint_content(path, content)]
+        assert_in(rule_id, ids, f"{rule_id} must fire on its sample (got {ids})")
+    clean = ("<?php\ndeclare(strict_types=1);\nnamespace Vendor\\Faq\\Model;\n"
+             "class Clean { public function __construct(private readonly \\Psr\\Log\\LoggerInterface $l) {} }\n")
+    findings = [f for f in lint_content("Clean.php", clean) if f.severity != "info"]
+    assert_true(findings == [], f"clean code must pass: {[(f.rule_id, f.message) for f in findings]}")
+    esc = "<p><?= $escaper->escapeHtml($name) ?></p>"
+    assert_true(not any(f.rule_id == "MP009" for f in lint_content("v.phtml", esc)),
+                "escaped output must not trigger MP009")
+
+
+@test("scan_op: path policy blocks vendor//generated//env.php; edits lint the new text")
+def _():
+    for path in ("vendor/magento/module-catalog/Model/X.php", "generated/code/Y.php",
+                 "app/etc/env.php"):
+        f = safety_scan.scan_op({"op": "create", "path": path, "content": "<?php // x"})
+        assert_true(any(x.rule_id == "MP007" and x.severity == "block" for x in f),
+                    f"{path} must be write-blocked")
+    f = safety_scan.scan_op({"op": "edit", "path": "app/code/V/M/X.php",
+                             "find": "old", "replace": "$d = unserialize($raw);"})
+    assert_true(any(x.rule_id == "MP004" for x in f), "edit replace-text must be linted")
+    assert_true(not any(x.rule_id == "MP015" for x in f),
+                "a fragment can't carry declare() — MP015 must not fire on edits")
+
+
+@test("run_make refuses BLOCK-lint content even in full-auto; reports why")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-block-")
+    bad_plan = [{"op": "create", "path": "app/code/V/M/Bad.php",
+                 "content": "<?php $om = \\Magento\\Framework\\App\\ObjectManager::getInstance();"},
+                {"op": "create", "path": "app/code/V/M/Good.php",
+                 "content": "<?php\ndeclare(strict_types=1);\nnamespace V\\M;\nclass Good {}"}]
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda t, r: bad_plan
+    try:
+        res = edits.run_make("x", d, auto=True)
+    finally:
+        scaffold.generate_plan = orig
+    assert_true(not os.path.exists(os.path.join(d, "app/code/V/M/Bad.php")),
+                "BLOCK content must never reach disk")
+    assert_true(os.path.isfile(os.path.join(d, "app/code/V/M/Good.php")))
+    assert_true(res["blocked"] and "MP001" in res["blocked"][0]["reasons"][0], str(res["blocked"]))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("write_file tool refuses secrets and protected paths")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-wsec-")
+    ctx = ToolContext(root=d, approver=lambda t, a: "yes")
+    out = tools.REGISTRY.dispatch(ctx, "write_file",
+                                  '{"path": "app/code/V/M/K.php", "content": "<?php $apiKey = \'sk_live_abcDEF123456789xyz\';"}')
+    assert_in("MP006", out)
+    assert_true(not os.path.exists(os.path.join(d, "app/code/V/M/K.php")))
+    out = tools.REGISTRY.dispatch(ctx, "write_file",
+                                  '{"path": "vendor/x/y/Z.php", "content": "<?php // x"}')
+    assert_in("MP007", out)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== Phase 3: review
+@test("reviewer parses ISSUE lines, discards garbage, handles NO ISSUES and downtime")
+def _():
+    sample = ("Here are my findings:\n"
+              "ISSUE: app/code/V/M/X.php:10 [sec] high unescaped output — use $escaper->escapeHtml()\n"
+              "random prose that is not an issue line\n"
+              "ISSUE: app/code/V/M/Y.php:5 [perf] low collection not page-bounded\n")
+    issues = reviewer.parse_issues(sample)
+    assert_true(len(issues) == 2 and issues[0].category == "sec" and issues[0].line == 10,
+                str(issues))
+    assert_true(reviewer.review_diff("diff --git a b", complete=lambda m: "NO ISSUES") == [])
+    assert_true(reviewer.review_diff("diff --git a b",
+                                     complete=lambda m: (_ for _ in ()).throw(OSError("down")))
+                is None, "unreachable model → None (caller reports gracefully)")
+    assert_true(reviewer.review_diff("") == [], "empty diff → no issues, no model call")
+
+
 def main() -> int:
     passed = failed = 0
     print(f"running {len(_results)} deterministic tests (no model)\n")

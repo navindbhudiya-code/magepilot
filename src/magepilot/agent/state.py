@@ -49,6 +49,7 @@ class RunState:
     steps_used: int = 0
     replans: int = 0
     answer: str = ""               # the final summary shown to the user
+    memory_block: str = ""         # recalled Known-facts block (injected into prompts)
     started_at: str = ""
     checkpointed_at: str = ""
     version: int = CHECKPOINT_VERSION

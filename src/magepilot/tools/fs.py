@@ -67,6 +67,20 @@ def find_files(root: str, pattern: str) -> str:
     return _clip(f"{len(hits)} file(s) matching '{pattern}':\n" + "\n".join(hits[:100]))
 
 
+_SYMBOLISH = re.compile(r"\\\\|\\|[A-Z][a-z]+[A-Z]")
+
+
+def _no_match(root: str, pattern: str) -> str:
+    """Empty-result message, plus a graph hint when the pattern looks like a symbol."""
+    msg = f"no matches for '{pattern}'"
+    if _SYMBOLISH.search(pattern):
+        from magepilot.graph.store import graph_path
+        if os.path.exists(graph_path(root)):
+            msg += ("\nhint: try the `symbol` tool — the knowledge graph indexes "
+                    "vendor/ symbols and exact wiring")
+    return msg
+
+
 def grep(root: str, pattern: str, glob: str = None) -> str:
     """Literal/regex search for exact symbols across the codebase (ripgrep if available)."""
     root_dir = _safe_path(root, ".")
@@ -87,7 +101,7 @@ def grep(root: str, pattern: str, glob: str = None) -> str:
             return f"grep failed: {e}"
         out = "\n".join(os.path.relpath(line, root) if line.startswith(root_dir) else line
                         for line in out.splitlines())
-        return _clip(out) if out.strip() else f"no matches for '{pattern}'"
+        return _clip(out) if out.strip() else _no_match(root, pattern)
 
     # Fallback: pure-Python walk + regex.
     try:
@@ -120,7 +134,7 @@ def grep(root: str, pattern: str, glob: str = None) -> str:
                 continue
         if count >= 50 or time.monotonic() > deadline:
             break
-    return _clip("\n".join(results)) if results else f"no matches for '{pattern}'"
+    return _clip("\n".join(results)) if results else _no_match(root, pattern)
 
 
 # --------------------------------------------------------------------------- semantic search

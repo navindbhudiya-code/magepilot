@@ -15,6 +15,11 @@ dependencies = [
     # mlx-lm pulls protobuf 7.x, which makes the resolver drop chromadb's otel exporter
     # back to 1.11.1, whose generated _pb2 files crash on import under protobuf 7.
     "protobuf<7",
+    # the Magento knowledge graph parses PHP in-process (error-tolerant, no PHP runtime)
+    "tree-sitter>=0.21",
+    "tree-sitter-php>=0.22",
+    # XML configs from arbitrary codebases are untrusted input — harden against XXE
+    "defusedxml",
 ]
 
 [project.optional-dependencies]

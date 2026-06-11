@@ -156,6 +156,14 @@ def main(argv=None) -> int:
 
     sub.add_parser("runs", help="list recent agent runs")
 
+    p_g = sub.add_parser("graph", help="build/update the Magento knowledge graph")
+    p_g.add_argument("--root")
+    p_g.add_argument("--no-vendor", action="store_true",
+                     help="skip vendor/ (faster, but core wiring answers degrade)")
+
+    p_rev = sub.add_parser("review", help="review the uncommitted diff (advisory)")
+    p_rev.add_argument("--root")
+
     args = ap.parse_args(argv)
 
     if args.cmd == "index":
@@ -232,6 +240,26 @@ def main(argv=None) -> int:
             return 0
         for r in rows[:20]:
             print(f"{r['run_id']:<46} {r['status']:<8} {r['objective'][:60]}")
+        return 0
+
+    if args.cmd == "graph":
+        from magepilot.graph.build import build as build_graph
+        root = _resolve_root(args.root)
+        build_graph(root, vendor=not args.no_vendor)
+        return 0
+
+    if args.cmd == "review":
+        from magepilot.review.reviewer import review_uncommitted
+        root = _resolve_root(args.root)
+        issues = review_uncommitted(root)
+        if issues is None:
+            print("nothing to review (no uncommitted changes, or the model is unreachable).")
+            return 0
+        if not issues:
+            print("no issues found.")
+            return 0
+        for i in issues:
+            print(f"  {i.severity.upper():<6} {i.file}:{i.line} [{i.category}] {i.text}")
         return 0
 
     if args.cmd == "sql":
