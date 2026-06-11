@@ -9,7 +9,8 @@
 
 <p align="center">
   <a href="https://huggingface.co/navindbhudiya/qwen2.5-coder-7b-magento-v2"><img alt="model" src="https://img.shields.io/badge/%F0%9F%A4%97%20model-Qwen2.5--Coder--Magento-yellow"></a>
-  <img alt="platform" src="https://img.shields.io/badge/Apple%20Silicon-MLX-black?logo=apple&logoColor=white">
+  <img alt="bundled platform" src="https://img.shields.io/badge/Apple%20Silicon-MLX-black?logo=apple&logoColor=white">
+  <img alt="also runs on" src="https://img.shields.io/badge/Linux%20%C2%B7%20Windows%20%C2%B7%20WSL-via%20Ollama-2496ed">
   <img alt="stack" src="https://img.shields.io/badge/Magento%202-Hyv%C3%A4-f46f25">
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-3fb950"></a>
   <a href="https://huggingface.co/navindbhudiya/qwen2.5-coder-7b-magento-v2"><img alt="model license" src="https://img.shields.io/badge/model%20license-Apache--2.0-blue"></a>
@@ -21,7 +22,7 @@
 A **private, locally-running AI coding agent** for **Magento 2 + Hyvä** (PHP 8, Alpine.js, Tailwind).
 From one interactive shell it answers questions, **inspects your real codebase**, **creates and edits files**
 (with per-change approval), **runs the right `bin/magento` commands**, and **debugs the database** — all on
-your machine, like a Magento-native `claude`. **No code leaves your Mac.**
+your machine, like a Magento-native `claude`. **No code leaves your machine.**
 
 ---
 
@@ -49,7 +50,8 @@ Re-running the one-liner later updates an existing install (`git pull`).
 git clone https://github.com/navindbhudiya-code/magepilot.git
 cd magepilot
 
-brew install uv             # if you don't have it
+brew install uv                                 # macOS — if you don't have it
+# Linux / WSL: curl -LsSf https://astral.sh/uv/install.sh | sh
 ./magepilot install         # env + deps + knowledge base, and adds `magepilot` to your PATH
 ```
 
@@ -79,8 +81,10 @@ Open a new terminal afterwards so `magepilot` is picked up. Then you can run it 
 
 ## Requirements
 
-- **Apple Silicon Mac (M1–M4)** — required for the **bundled** setup (the MLX model + `mlx_lm.server`).
-  MLX runs only on Apple Silicon, and the model is published in MLX format. *Other platforms: see below.*
+- **A machine to run the model on** — either:
+  - **Apple Silicon Mac (M1–M4)** for the **bundled** one-command setup (the MLX model + `mlx_lm.server`), or
+  - **any Linux / Windows / WSL box** that can serve `Qwen2.5-Coder-7B` via Ollama/llama.cpp/vLLM —
+    the agent and RAG layers are pure-Python and cross-platform. *See [Running on Linux / Windows / WSL](#running-on-linux--windows--wsl).*
 - **[`uv`](https://docs.astral.sh/uv/)** (Python package manager): `brew install uv` — *the
   [quick installer](#quick-install) sets this up for you automatically.*
 - ~**5 GB** free disk (the model downloads once).
