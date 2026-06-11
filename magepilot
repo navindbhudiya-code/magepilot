@@ -185,6 +185,8 @@ ${c_green}Use${c_off}
   ./magepilot suggest --root <store>      propose & run the Magento commands your changes need
   ./magepilot watch --root <store>        keep proposing commands as you edit files
   ./magepilot sql --root <store> "<SQL>"  run a read-only query against the store DB
+  ./magepilot mcp-serve --root <store>    expose the tools as an MCP stdio server (for Claude Code etc.)
+  ./magepilot testgen "<FQCN>"            generate a PHPUnit unit test for a class
 
   (index/run/suggest/watch/sql forward straight to the agent CLI — all its flags work.)
 
@@ -205,6 +207,7 @@ case "$cmd" in
   status)             cmd_status "$@" ;;
   ask)                cmd_ask "$@" ;;
   index|run|suggest|watch|sql|make|undo|do|resume|runs|graph|review|testgen) cmd_agent "$cmd" "$@" ;;
+  mcp-serve)          activate 1>&2; cd "$ROOT"; exec python -m magepilot mcp-serve "$@" ;;
   help|-h|--help)     usage ;;
   *)                  warn "unknown command: $cmd"; echo; usage; exit 1 ;;
 esac

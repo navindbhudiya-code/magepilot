@@ -10,7 +10,7 @@ import os
 import tomllib
 
 import magepilot.config.defaults as defaults
-from magepilot.config.schema import Config, LimitsCfg, ProviderCfg
+from magepilot.config.schema import Config, LimitsCfg, McpServerCfg, ProviderCfg
 
 USER_CONFIG = os.path.expanduser("~/.magepilot/config.toml")
 PROJECT_CONFIG_NAME = ".magepilot.toml"
@@ -63,12 +63,20 @@ def load(project_root: str | None = None) -> Config:
         wall_clock_minutes=int(lim.get("wall_clock_minutes", LimitsCfg.wall_clock_minutes)),
     )
 
+    mcp_servers = {}
+    for name, m in (data.get("mcp_servers") or {}).items():
+        if m.get("command"):
+            mcp_servers[name] = McpServerCfg(
+                name=name, command=m["command"], args=tuple(m.get("args") or ()),
+                read_only=bool(m.get("read_only", False)))
+
     cfg = Config(
         providers=providers,
         roles=roles,
         limits=limits,
         sampling={**defaults.SAMPLING, **(data.get("sampling") or {})},
         strict_models=bool(data.get("strict_models", False)),
+        mcp_servers=mcp_servers,
     )
 
     # Env wins over files (v1 back-compat).

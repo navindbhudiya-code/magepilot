@@ -629,11 +629,19 @@ def _():
         r.cfg.strict_models = False
 
 
-@test("cloud provider types raise a clear not-implemented error (Phase 6)")
+@test("cloud providers refuse to run without their API key (privacy + clarity)")
 def _():
-    assert_raises(llm_providers.ProviderError, llm_providers.chat,
-                  ProviderCfg(name="anthropic", type="anthropic"), "claude-x",
-                  [{"role": "user", "content": "hi"}])
+    saved = os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        assert_raises(llm_providers.ProviderError, llm_providers.chat,
+                      ProviderCfg(name="anthropic", type="anthropic"), "claude-x",
+                      [{"role": "user", "content": "hi"}])
+        assert_raises(llm_providers.ProviderError, llm_providers.chat,
+                      ProviderCfg(name="openai", type="openai"), "gpt-x",
+                      [{"role": "user", "content": "hi"}])
+    finally:
+        if saved is not None:
+            os.environ["ANTHROPIC_API_KEY"] = saved
 
 
 # ================================================================== Phase 2: orchestrator
@@ -1564,6 +1572,128 @@ def _():
     finally:
         g.close()
     shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== Phase 6: MCP + cloud
+from magepilot.config.schema import McpServerCfg                      # noqa: E402
+from magepilot.mcp import client as mcp_client, server as mcp_server  # noqa: E402
+from magepilot.tools.registry import ToolRegistry as _TR              # noqa: E402
+
+
+@test("anthropic payload builder: system extracted, sampling filtered, stops kept")
+def _():
+    prov = ProviderCfg(name="anthropic", type="anthropic")
+    url, headers, body = llm_providers.anthropic_request(
+        prov, "claude-sonnet-4-5",
+        [{"role": "system", "content": "be terse"}, {"role": "user", "content": "hi"}],
+        stop=["Observation:", "<|im_end|>"],
+        sampling={"temperature": 0.15, "repetition_penalty": 1.1, "max_tokens": 900},
+        api_key="k-test")
+    assert_true(url.endswith("/v1/messages"))
+    assert_true(headers["x-api-key"] == "k-test" and "anthropic-version" in headers)
+    assert_true(body["system"] == "be terse")
+    assert_true(all(m["role"] != "system" for m in body["messages"]))
+    assert_true(body["max_tokens"] == 900 and body["temperature"] == 0.15)
+    assert_true("repetition_penalty" not in body, "unsupported keys must be filtered")
+    assert_in("Observation:", body["stop_sequences"])
+    assert_true(llm_providers.parse_anthropic(
+        {"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}) == "ab")
+
+
+@test("config loader parses [mcp_servers.*] declarations")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mcpcfg-")
+    open(os.path.join(d, ".magepilot.toml"), "w").write(
+        '[mcp_servers.ctx7]\ncommand = "npx"\nargs = ["-y", "ctx7-mcp"]\nread_only = true\n')
+    orig = config_loader.USER_CONFIG
+    config_loader.USER_CONFIG = os.path.join(d, "nonexistent.toml")
+    try:
+        cfg = config_loader.load(d)
+    finally:
+        config_loader.USER_CONFIG = orig
+    assert_true("ctx7" in cfg.mcp_servers)
+    m = cfg.mcp_servers["ctx7"]
+    assert_true(m.command == "npx" and m.args == ("-y", "ctx7-mcp") and m.read_only)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("MCP server handle(): init, read-only listing, calls, errors, notifications")
+def _():
+    ctx = ToolContext(root=ROOT)
+    r = mcp_server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize"}, ctx, False)
+    assert_true(r["result"]["serverInfo"]["name"] == "magepilot")
+    assert_true(mcp_server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"},
+                                  ctx, False) is None)
+    tools_ro = {t["name"] for t in mcp_server.handle(
+        {"id": 2, "method": "tools/list"}, ctx, False)["result"]["tools"]}
+    assert_in("grep", tools_ro)
+    assert_in("wiring", tools_ro)
+    assert_true("write_file" not in tools_ro, "writes hidden without --allow-writes")
+    tools_rw = {t["name"] for t in mcp_server.handle(
+        {"id": 3, "method": "tools/list"}, ctx, True)["result"]["tools"]}
+    assert_in("write_file", tools_rw)
+    r = mcp_server.handle({"id": 4, "method": "tools/call",
+                           "params": {"name": "grep",
+                                      "arguments": {"pattern": "NoSuchEntityException"}}},
+                          ctx, False)
+    assert_in("FaqRepository.php", r["result"]["content"][0]["text"])
+    assert_true(not r["result"]["isError"])
+    r = mcp_server.handle({"id": 5, "method": "tools/call",
+                           "params": {"name": "write_file",
+                                      "arguments": {"path": "x.php", "content": "x"}}},
+                          ctx, False)
+    assert_true(r["result"]["isError"], "write tools must refuse without --allow-writes")
+    r = mcp_server.handle({"id": 6, "method": "no/such"}, ctx, False)
+    assert_true(r["error"]["code"] == -32601)
+
+
+@test("MCP loopback: our client drives our server over real stdio (the acceptance)")
+def _():
+    import sys as _sys
+    cfg = McpServerCfg(name="magepilot_self", command=_sys.executable,
+                       args=("-m", "magepilot", "mcp-serve", "--root", ROOT))
+    srv = mcp_client.McpServer(cfg)
+    try:
+        srv.initialize()
+        specs = srv.list_tools()
+        names = {t["name"] for t in specs}
+        assert_in("grep", names)
+        assert_in("symbol", names)
+        assert_true("write_file" not in names)
+        grep_spec = next(t for t in specs if t["name"] == "grep")
+        assert_true(grep_spec["inputSchema"]["properties"]["pattern"]["type"] == "string")
+        out = srv.call("grep", {"pattern": "class AddSurcharge"})
+        assert_in("AddSurcharge", out)
+        out = srv.call("magento_logs", {"log": "../etc/passwd"})
+        assert_in("error", out)
+    finally:
+        srv.close()
+
+
+@test("MCP client: wrapped tools default to MUTATE and pass the approval gate")
+def _():
+    class FakeSrv:
+        cfg = McpServerCfg(name="ext", command="x", read_only=False)
+        def call(self, name, arguments):
+            return f"called {name} with {arguments.get('q')}"
+    spec = {"name": "lookup", "description": "find things",
+            "inputSchema": {"type": "object",
+                            "properties": {"q": {"type": "string", "description": "query"}},
+                            "required": ["q"]}}
+    reg = _TR()
+    tool = mcp_client.wrap_tool(FakeSrv(), spec, set())
+    reg.register(tool)
+    assert_true(tool.risk is RiskLevel.MUTATE, "external tools are approval-gated by default")
+    assert_in("[ext]", tool.description)
+    out = reg.dispatch(ToolContext(root="."), "lookup", '{"q": "x"}')
+    assert_in("requires approval", out)
+    out = reg.dispatch(ToolContext(root=".", approver=lambda t, a: "yes"), "lookup", '{"q": "x"}')
+    assert_true(out == "called lookup with x", out)
+    ro = mcp_client.wrap_tool(
+        FakeSrv.__class__("F", (), {"cfg": McpServerCfg(name="ext", command="x", read_only=True),
+                                    "call": lambda self, n, a: "ok"})(), spec, {"lookup"})
+    assert_true(ro.risk is RiskLevel.READ and ro.name == "ext_lookup",
+                f"read_only + collision prefix: {ro.name} {ro.risk}")
 
 
 def main() -> int:
