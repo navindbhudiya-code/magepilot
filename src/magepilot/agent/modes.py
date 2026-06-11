@@ -54,9 +54,10 @@ MODES = {m.name: m for m in (
          "BEFORE changing it; preserve public behavior; never widen scope.",
          tools=_BUILD + ("git_log", "git_blame")),
     Mode("test",
-         "Write tests for existing behavior. Read the class under test first; mock its "
-         "constructor dependencies (the `symbol` tool lists them); one test class per "
-         "subject under Test/Unit/.",
+         "Write tests for existing behavior. Unit: read the class first and mock its "
+         "constructor dependencies (`symbol` lists them), one test class per subject "
+         "under Test/Unit/. Storefront: MFTF scaffolds and Playwright specs come from "
+         "`magepilot testgen --kind mftf|playwright` using graph-derived selectors.",
          tools=_BUILD),
     Mode("autonomous",
          "Work the objective end to end. Investigate before editing, verify after every "
