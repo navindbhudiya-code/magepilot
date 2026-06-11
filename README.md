@@ -212,6 +212,33 @@ magepilot sql "SELECT entity_id, sku FROM catalog_product_entity LIMIT 20"
 > Make sure `~/.local/bin` is on your `PATH` (or symlink into `/usr/local/bin` with `sudo`), then open a
 > new terminal. Now `cd` into any Magento project and just run `magepilot`.
 
+### In Claude Code (or any MCP client)
+
+Magepilot is also an **MCP server** — give Claude Code (Cursor, Zed, …) exact Magento
+answers from your store's knowledge graph instead of letting it grep vendor/:
+
+```bash
+claude mcp add magepilot -- ~/.magepilot/magepilot mcp-serve --root /path/to/your-store
+```
+
+That exposes all 21 **read-only** tools (`wiring`, `symbol`, `impact`, `diagnose_plugin`,
+`search`, `stack_trace`, `git_log`, `sql_query`, …) over stdio. Claude Code can then ask
+*"what plugins intercept `ProductRepository::save`?"* or *"which service handles
+`GET /V1/products/:sku`?"* and get graph facts, not guesses. Run `magepilot graph` in the
+store once first. Write tools are **excluded by default**; opt in with
+`mcp-serve --allow-writes` (your MCP client's permission prompts then gate them —
+Magepilot's sandbox, linter, and undo still apply).
+
+It works the other way too: declare external **MCP servers** in `~/.magepilot/config.toml`
+and their tools join Magepilot's agent behind the same approval gate:
+
+```toml
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+# read_only = true   # opt-in: skip the approval prompt for this server's tools
+```
+
 ### In PhpStorm
 1. **Settings → Plugins →** install **Continue**, then restart the IDE.
 2. `cp serving/phpstorm-continue.yaml ~/.continue/config.yaml`
