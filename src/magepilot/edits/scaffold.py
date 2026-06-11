@@ -78,8 +78,11 @@ def _context(task: str, root: str) -> str:
 
 def _complete_coder(messages: list[dict]) -> str:
     """The single coder-role call — manifest re-prompts and repair rounds go through
-    here too, so tests have ONE monkeypatch point."""
-    return get_router().complete("coder", messages, stop=["<|im_end|>"])
+    here too, so tests have ONE monkeypatch point. max_tokens is raised above the
+    global default: a complete multi-file plan (4+ files) doesn't fit in 900 tokens,
+    which used to silently truncate plans into 'missing companion file' failures."""
+    return get_router().complete("coder", messages, stop=["<|im_end|>"],
+                                 sampling={"max_tokens": 2400})
 
 
 def generate_plan(task: str, root: str) -> list[dict]:
