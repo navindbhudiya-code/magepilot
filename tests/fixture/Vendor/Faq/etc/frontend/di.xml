@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <!-- area-specific disable of the global plugin: the case grep can never answer -->
+    <type name="Magento\Catalog\Model\Product">
+        <plugin name="vendor_faq_add_surcharge" disabled="true"/>
+    </type>
+    <type name="Vendor\Faq\Model\FaqManager">
+        <arguments>
+            <argument name="processors" xsi:type="array">
+                <item name="default" xsi:type="object">Vendor\Faq\Model\FaqRepository</item>
+            </argument>
+        </arguments>
+    </type>
+</config>

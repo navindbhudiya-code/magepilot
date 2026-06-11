@@ -33,7 +33,13 @@ die()  { echo "${c_red}✗${c_off} $*" >&2; exit 1; }
 
 need_venv() { [ -x "$VENV/bin/python" ] || die "environment missing — run: ./magepilot install"; }
 activate()  { need_venv; # shellcheck disable=SC1091
-              source "$VENV/bin/activate"; }
+              source "$VENV/bin/activate"
+              # self-heal after a `git pull`: older envs predate the magepilot package
+              python -c "import magepilot" 2>/dev/null || {
+                command -v uv >/dev/null 2>&1 || die "environment outdated — run: ./magepilot install"
+                info "updating environment (new package layout)…"
+                uv pip install -q -e "$ROOT" || die "package install failed — run: ./magepilot install"
+              }; }
 up() { curl -s -m 3 "http://127.0.0.1:$1/v1/models" >/dev/null 2>&1; }
 # MLX (the bundled model server) publishes wheels for Apple Silicon only. Elsewhere we
 # skip mlx-lm and the user points the stack at their own server via MODEL_SERVER.
@@ -50,13 +56,13 @@ cmd_install() {
   # import under protobuf 7 ("Descriptors cannot be created directly"). Capping protobuf at
   # <7 keeps protobuf 6.x + a modern (1.42.x) otel stack, so chromadb imports cleanly.
   if is_apple_silicon; then
-    info "installing dependencies (mlx-lm, chromadb, prompt_toolkit)…"
-    uv pip install -q mlx-lm chromadb prompt_toolkit 'protobuf<7'
+    info "installing magepilot + dependencies (mlx-lm, chromadb, prompt_toolkit)…"
+    uv pip install -q -e "$ROOT[mlx]"
   else
     warn "not Apple Silicon — skipping mlx-lm (MLX is Apple-Silicon only)."
     warn "serve a model yourself and export MODEL_SERVER (see README's Linux/Windows section)."
-    info "installing dependencies (chromadb, prompt_toolkit)…"
-    uv pip install -q chromadb prompt_toolkit 'protobuf<7'
+    info "installing magepilot + dependencies (chromadb, prompt_toolkit)…"
+    uv pip install -q -e "$ROOT"
   fi
   info "building the Magento knowledge base…"
   python "$ROOT/rag/ingest.py" >/dev/null
@@ -141,7 +147,7 @@ cmd_stop() {
   pkill -f "mlx_lm.server --model $MODEL" 2>/dev/null || true
   pkill -f "rag/rag_server.py"        2>/dev/null || true
   pkill -f "rag/ask.py"               2>/dev/null || true
-  pkill -f "agent\.cli"               2>/dev/null || true
+  pkill -f "[-]m magepilot (index|run|suggest|watch|sql|make|undo)" 2>/dev/null || true
   ok "stopped."
 }
 
@@ -152,7 +158,7 @@ cmd_status() {
 
 # ----------------------------------------------------------------------------- use
 cmd_ask()     { activate; python "$ROOT/rag/ask.py" "$@"; }
-cmd_agent()   { activate; cd "$ROOT"; python -m agent.cli "$@"; }   # index|run|suggest|watch|sql
+cmd_agent()   { activate; cd "$ROOT"; python -m magepilot "$@"; }   # index|run|suggest|watch|sql
 
 usage() {
   cat <<EOF
@@ -171,6 +177,9 @@ ${c_green}Use${c_off}
   ./magepilot ask "<question>"            ask the grounded assistant
   ./magepilot index --root <store>        index a Magento codebase for the agent
   ./magepilot run "<task>"                ask the agent about the indexed codebase
+  ./magepilot do "<objective>"            plan + execute a multi-step objective (approve each change)
+  ./magepilot resume [run-id]             continue a paused/interrupted run
+  ./magepilot runs                        list recent runs
   ./magepilot make "<task>"               create/edit files for a task (approve each change)
   ./magepilot undo                        revert the files changed by the last make
   ./magepilot suggest --root <store>      propose & run the Magento commands your changes need
@@ -189,13 +198,13 @@ EOF
 # ----------------------------------------------------------------------------- dispatch
 cmd="${1:-chat}"; shift || true
 case "$cmd" in
-  chat)               activate; cd "$ROOT"; exec python -m agent.repl ;;   # interactive shell (default)
+  chat)               activate; cd "$ROOT"; exec python -m magepilot ;;    # interactive shell (default)
   install)            cmd_install "$@" ;;
   serve|start)        cmd_serve "$@" ;;
   stop)               cmd_stop "$@" ;;
   status)             cmd_status "$@" ;;
   ask)                cmd_ask "$@" ;;
-  index|run|suggest|watch|sql|make|undo) cmd_agent "$cmd" "$@" ;;
+  index|run|suggest|watch|sql|make|undo|do|resume|runs|graph|review) cmd_agent "$cmd" "$@" ;;
   help|-h|--help)     usage ;;
   *)                  warn "unknown command: $cmd"; echo; usage; exit 1 ;;
 esac

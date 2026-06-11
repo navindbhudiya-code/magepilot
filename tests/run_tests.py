@@ -1,0 +1,1385 @@
+"""Deterministic tests for MagePilot — NO model required.
+
+Covers the parts whose correctness must not depend on the LLM: the sandbox, every tool,
+the CLI whitelist, the ReAct parser, code indexing + semantic search on a fixture module,
+and (new in v2) the tool registry/permission gate, the config loader, and the model router.
+
+    python tests/run_tests.py
+"""
+import os
+import shutil
+import tempfile
+import traceback
+
+from magepilot import config
+
+# Redirect the code index to a throwaway dir BEFORE the collection is opened.
+_TMP = tempfile.mkdtemp(prefix="magepilot-test-")
+config.CODE_CHROMA_PATH = os.path.join(_TMP, "code_index")
+config.ROOT_MARKER = os.path.join(config.CODE_CHROMA_PATH, "root.txt")
+config.UNDO_FILE = os.path.join(_TMP, "last_make.json")
+config.RUNS_DIR = os.path.join(_TMP, "runs")
+
+from magepilot import edits, tools                                    # noqa: E402
+from magepilot.agent import compress, loop, planner                   # noqa: E402
+from magepilot.agent import react as react_agent                      # noqa: E402
+from magepilot.agent import state as run_state                       # noqa: E402
+from magepilot.config import loader as config_loader                  # noqa: E402
+from magepilot.config.schema import Config, LimitsCfg, ProviderCfg    # noqa: E402
+from magepilot.edits import scaffold                                  # noqa: E402
+from magepilot.index import codebase as codebase_index                # noqa: E402
+from magepilot.llm import providers as llm_providers                  # noqa: E402
+from magepilot.llm.router import Router, RouterError                  # noqa: E402
+from magepilot.magento import db, suggest                             # noqa: E402
+from magepilot.safety import policy as actions                        # noqa: E402
+from magepilot.tools.base import Param, RiskLevel, Tool, ToolContext  # noqa: E402
+from magepilot.tools.registry import ToolRegistry                     # noqa: E402
+
+codebase_index._collections.clear()
+
+FIXTURE = os.path.join(os.path.dirname(__file__), "fixture")
+ROOT = os.path.join(FIXTURE, "Vendor", "Faq")
+
+_results = []
+
+
+def test(name):
+    def deco(fn):
+        _results.append((name, fn))
+        return fn
+    return deco
+
+
+def assert_true(cond, msg=""):
+    if not cond:
+        raise AssertionError(msg or "expected truthy")
+
+
+def assert_in(needle, hay, msg=""):
+    if needle not in hay:
+        raise AssertionError(msg or f"expected '{needle}' in: {hay[:200]!r}")
+
+
+def assert_raises(exc, fn, *a, **k):
+    try:
+        fn(*a, **k)
+    except exc:
+        return
+    raise AssertionError(f"expected {exc.__name__} to be raised")
+
+
+# ------------------------------------------------------------------ sandbox + file tools
+@test("sandbox blocks path traversal outside the root")
+def _():
+    assert_raises(tools.ToolError, tools.read_file, ROOT, "../../../../etc/passwd")
+    assert_raises(tools.ToolError, tools.read_file, ROOT, "/etc/passwd")
+
+
+@test("read_file returns content and respects a line range")
+def _():
+    out = tools.read_file(ROOT, "Model/FaqRepository.php")
+    assert_in("NoSuchEntityException", out)
+    ranged = tools.read_file(ROOT, "Model/FaqRepository.php", 1, 3)
+    assert_in("declare(strict_types=1)", ranged)
+    assert_true("getById" not in ranged, "line range should exclude later lines")
+
+
+@test("list_dir lists module subdirectories")
+def _():
+    out = tools.list_dir(ROOT, ".")
+    assert_in("Model/", out)
+    assert_in("etc/", out)
+    assert_in("registration.php", out)
+
+
+@test("find_files matches by glob and substring")
+def _():
+    assert_in("etc/di.xml", tools.find_files(ROOT, "di.xml"))
+    assert_in("FaqRepository.php", tools.find_files(ROOT, "*Repository.php"))
+    assert_in("no files match", tools.find_files(ROOT, "*.tsx"))
+
+
+@test("grep finds an exact symbol with file:line")
+def _():
+    out = tools.grep(ROOT, "NoSuchEntityException")
+    assert_in("FaqRepository.php", out)
+    assert_in("class AddSurcharge", tools.grep(ROOT, "class AddSurcharge"))
+
+
+# ------------------------------------------------------------------ cli safety
+@test("magento_cli rejects non-whitelisted commands")
+def _():
+    assert_raises(tools.ToolError, tools.magento_cli, ROOT, "setup:upgrade")
+    assert_raises(tools.ToolError, tools.magento_cli, ROOT, "cache:flush")
+
+
+@test("magento_cli rejects shell metacharacters")
+def _():
+    assert_raises(tools.ToolError, tools.magento_cli, ROOT, "module:status; rm -rf /")
+    assert_raises(tools.ToolError, tools.magento_cli, ROOT, "module:status && curl evil")
+
+
+@test("magento_cli allows a whitelisted command but reports no Magento root")
+def _():
+    out = tools.magento_cli(ROOT, "module:status")
+    assert_in("no Magento root configured", out)
+
+
+# ------------------------------------------------------------------ dispatch + arg parsing
+@test("run_tool dispatches and reports unknown tools / bad args safely")
+def _():
+    assert_in("unknown tool", tools.run_tool(ROOT, "nope", "x"))
+    assert_in("NoSuchEntityException", tools.run_tool(ROOT, "grep", "NoSuchEntityException"))
+    # JSON object input for read_file
+    out = tools.run_tool(ROOT, "read_file", '{"path": "Plugin/AddSurcharge.php", "start": 1, "end": 5}')
+    assert_in("AddSurcharge", out)
+
+
+@test("_parse_args accepts JSON objects and plain strings")
+def _():
+    assert_true(tools._parse_args('{"path":"a","start":2}', "path") == {"path": "a", "start": 2})
+    assert_true(tools._parse_args('"hello"', "query") == {"query": "hello"})
+    assert_true(tools._parse_args("plain text", "pattern") == {"pattern": "plain text"})
+    assert_true(tools._parse_args("", "query") == {})
+
+
+# ------------------------------------------------------------------ ReAct parser
+@test("ReAct parser extracts Action / Action Input")
+def _():
+    txt = "Thought: look it up\nAction: grep\nAction Input: NoSuchEntityException\n"
+    m = react_agent._ACTION_RE.search(txt)
+    assert_true(m is not None, "action regex should match")
+    assert_true(m.group(1).strip() == "grep")
+    assert_in("NoSuchEntityException", m.group(2))
+
+
+@test("ReAct parser extracts a Final Answer")
+def _():
+    m = react_agent._FINAL_RE.search("Thought: done\nFinal Answer: it is in FaqRepository.php:20")
+    assert_true(m is not None)
+    assert_in("FaqRepository.php", m.group(1))
+
+
+@test("_first_arg isolates a JSON object or the first line")
+def _():
+    assert_true(react_agent._first_arg('{"path":"a"}\nextra junk') == '{"path":"a"}')
+    assert_true(react_agent._first_arg("di.xml\nObservation: ...") == "di.xml")
+
+
+# ------------------------------------------------------------------ indexing + semantic search
+@test("build_index indexes the fixture and search_code finds the right file")
+def _():
+    n = codebase_index.build_index(ROOT, verbose=False)
+    assert_true(n > 0, "index should contain chunks")
+    out = tools.search_code(ROOT, "repository method that throws a not-found exception by id", k=5)
+    assert_in("FaqRepository.php", out)
+    out2 = tools.search_code(ROOT, "plugin that adds an extra charge to the product price", k=5)
+    assert_in("AddSurcharge.php", out2)
+
+
+# ------------------------------------------------------------------ command actions (safety)
+@test("classify tiers: auto / ask / blocked")
+def _():
+    assert_true(actions.classify("module:status") == "auto")
+    assert_true(actions.classify("cache:status") == "auto")
+    assert_true(actions.classify("setup:upgrade") == "ask")
+    assert_true(actions.classify("cache:clean config") == "ask")
+    assert_true(actions.classify("setup:uninstall") == "blocked", "non-whitelisted must block")
+    assert_true(actions.classify("setup:upgrade; rm -rf /") == "blocked", "metachars must block")
+    assert_true(actions.classify("rm -rf /") == "blocked")
+
+
+@test("execute refuses blocked commands without running")
+def _():
+    r = actions.execute(ROOT, "rm -rf /")
+    assert_true(r["ran"] is False and r["tier"] == "blocked")
+
+
+@test("execute requires approval for state-changing commands")
+def _():
+    calls = []
+    r = actions.execute(ROOT, "setup:upgrade", approver=lambda c, s: calls.append(c) or "no")
+    assert_true(calls == ["setup:upgrade"], "approver must be consulted")
+    assert_true(r["ran"] is False and r["reason"] == "declined by user")
+
+
+@test("execute never prompts for auto (read-only) commands")
+def _():
+    called = []
+    actions.execute(ROOT, "module:status", approver=lambda c, s: called.append(c) or "no")
+    assert_true(called == [], "auto-tier commands must not prompt")
+
+
+@test("'always' approval is remembered for the session")
+def _():
+    allow, n = set(), [0]
+    def always(cmd, sub):
+        n[0] += 1
+        return "always"
+    actions.execute(ROOT, "cache:clean", approver=always, allow_always=allow)
+    actions.execute(ROOT, "cache:clean", approver=always, allow_always=allow)
+    assert_true(n[0] == 1, "approver should run once, then auto-approve")
+    assert_true("cache:clean" in allow)
+
+
+# ------------------------------------------------------------------ change -> command mapping
+@test("suggest maps db_schema.xml to whitelist + upgrade, in order")
+def _():
+    cmds = [p["command"] for p in suggest.suggest(["app/code/Vendor/Mod/etc/db_schema.xml"])]
+    assert_true("setup:db-declaration:generate-whitelist" in cmds and "setup:upgrade" in cmds)
+    assert_true(cmds.index("setup:db-declaration:generate-whitelist") < cmds.index("setup:upgrade"),
+                "whitelist must be proposed before upgrade")
+
+
+@test("suggest maps di.xml and templates to the right cache cleans")
+def _():
+    di = [p["command"] for p in suggest.suggest(["app/code/V/M/etc/di.xml"])]
+    assert_true(any(c.startswith("cache:clean") for c in di))
+    tpl = [p["command"] for p in suggest.suggest(["app/code/V/M/view/frontend/templates/x.phtml"])]
+    assert_true(any("block_html" in c for c in tpl))
+
+
+@test("suggest returns nothing for irrelevant changes")
+def _():
+    assert_true(suggest.suggest(["README.md", "LICENSE", "docs/guide.txt", "notes.txt"]) == [])
+
+
+@test("parse_porcelain extracts paths and handles renames")
+def _():
+    files = suggest.parse_porcelain(
+        " M app/code/V/M/etc/di.xml\n?? new/File.php\nR  old.php -> app/code/V/M/Renamed.php\n")
+    joined = "\n".join(files)
+    assert_in("app/code/V/M/etc/di.xml", joined)
+    assert_in("app/code/V/M/Renamed.php", joined)
+
+
+@test("suggest covers composer, indexer, setup patches, and JS/static")
+def _():
+    assert_true(any(p["command"].startswith("composer") for p in suggest.suggest(["composer.json"])))
+    idx = [p["command"] for p in suggest.suggest(["app/code/V/M/etc/indexer.xml"])]
+    assert_true("indexer:reindex" in idx and "setup:upgrade" in idx)
+    patch = [p["command"] for p in suggest.suggest(["app/code/V/M/Setup/Patch/Data/AddX.php"])]
+    assert_true("setup:upgrade" in patch)
+    js = [p["command"] for p in suggest.suggest(["app/code/V/M/view/frontend/web/js/x.js"])]
+    assert_true(any("static-content" in c for c in js))
+
+
+@test("composer commands are tier 'ask'; unknown composer subcommands are blocked")
+def _():
+    assert_true(actions.classify("composer dump-autoload") == "ask")
+    assert_true(actions.classify("composer install") == "ask")
+    assert_true(actions.classify("composer require evil/pkg") == "blocked")
+    assert_true(actions.classify("composer remove x") == "blocked")
+
+
+# ------------------------------------------------------------------ read-only DB guard (safety)
+@test("db.is_read_only allows reads, refuses writes / DDL / stacking / file I/O")
+def _():
+    for ok in ["SELECT * FROM catalog_product_entity WHERE sku='x'", "select 1",
+               "SHOW TABLES", "DESCRIBE sales_order", "EXPLAIN SELECT 1"]:
+        assert_true(db.is_read_only(ok), f"should allow: {ok}")
+    for bad in ["INSERT INTO x VALUES(1)", "UPDATE x SET a=1", "DELETE FROM admin_user",
+                "DROP TABLE x", "ALTER TABLE x ADD c INT", "TRUNCATE x",
+                "SELECT 1; DROP TABLE x", "SELECT a FROM x INTO OUTFILE '/tmp/p'",
+                "CREATE TABLE x(a int)", "REPLACE INTO x VALUES(1)", "", "   "]:
+        assert_true(not db.is_read_only(bad), f"should refuse: {bad}")
+
+
+@test("db.run_query refuses a write without touching the DB")
+def _():
+    r = db.run_query(ROOT, "DELETE FROM admin_user")
+    assert_true(r["ok"] is False and "read-only" in r["error"])
+
+
+@test("db_credentials parses env.php (skipped if php is absent)")
+def _():
+    if not shutil.which("php"):
+        return  # environment has no php — skip; the read-only guard above is the safety-critical part
+    d = tempfile.mkdtemp(prefix="magepilot-env-")
+    os.makedirs(os.path.join(d, "app", "etc"))
+    with open(os.path.join(d, "app", "etc", "env.php"), "w") as f:
+        f.write("<?php return ['db'=>['connection'=>['default'=>["
+                "'host'=>'db','dbname'=>'magento','username'=>'magento','password'=>'magento']]]];")
+    cred = db.db_credentials(d)
+    shutil.rmtree(d, ignore_errors=True)
+    assert_true(cred and cred["db"] == "magento" and cred["user"] == "magento", f"got {cred}")
+
+
+# ------------------------------------------------------------------ write engine (edits)
+@test("edits.parse_plan parses create / mkdir / edit / delete blocks")
+def _():
+    text = ("@@MKDIR app/code/Vendor/Mod\n@@END\n"
+            "@@CREATE app/code/Vendor/Mod/registration.php\n<?php\n// reg\n@@END\n"
+            "@@EDIT app/code/Vendor/Mod/etc/module.xml\n@@FIND\nold\n@@REPLACE\nnew\n@@END\n"
+            "@@DELETE app/code/Vendor/Mod/junk.txt\n@@END\n")
+    ops = edits.parse_plan(text)
+    assert_true([o["op"] for o in ops] == ["mkdir", "create", "edit", "delete"], str(ops))
+    assert_in("// reg", ops[1]["content"])
+    assert_true(ops[2]["find"] == "old" and ops[2]["replace"] == "new")
+
+
+@test("edits.apply creates / edits / deletes files")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-edit-")
+    edits.apply(d, {"op": "mkdir", "path": "a/b"})
+    assert_true(os.path.isdir(os.path.join(d, "a/b")))
+    edits.apply(d, {"op": "create", "path": "a/b/x.php", "content": "<?php echo 1;"})
+    assert_true(os.path.isfile(os.path.join(d, "a/b/x.php")))
+    edits.apply(d, {"op": "edit", "path": "a/b/x.php", "find": "echo 1", "replace": "echo 2"})
+    assert_in("echo 2", open(os.path.join(d, "a/b/x.php")).read())
+    edits.apply(d, {"op": "delete", "path": "a/b/x.php"})
+    assert_true(not os.path.isfile(os.path.join(d, "a/b/x.php")))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("edits.apply refuses paths outside the project (sandbox)")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-edit-")
+    assert_raises(tools.ToolError, edits.apply, d, {"op": "create", "path": "../escape.txt", "content": "x"})
+    assert_raises(tools.ToolError, edits.apply, d, {"op": "delete", "path": "/etc/passwd"})
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("run_make applies approved changes and skips denied ones")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-make-")
+    plan = [{"op": "create", "path": "keep.php", "content": "<?php // keep"},
+            {"op": "create", "path": "skip.php", "content": "<?php // skip"}]
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda task, root: plan          # no model in tests
+    try:
+        decisions = iter(["yes", "no"])
+        res = edits.run_make("x", d, approver=lambda op: next(decisions))
+    finally:
+        scaffold.generate_plan = orig
+    assert_true(os.path.isfile(os.path.join(d, "keep.php")), "approved file should exist")
+    assert_true(not os.path.isfile(os.path.join(d, "skip.php")), "denied file must NOT exist")
+    assert_true(len(res["applied"]) == 1 and len(res["skipped"]) == 1)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ smart clarify + edit context
+@test("edits._extract pulls vendor/name from common phrasings")
+def _():
+    assert_true(edits._extract("create Vendor_Blog module") == ("Vendor", "Blog"))
+    v, n = edits._extract("create a module for vendor Vendor named Blog")
+    assert_true(v == "Vendor" and n == "Blog", f"got {(v, n)}")
+    assert_true(edits._extract("create a module")[0] is None)
+
+
+@test("edits.clarify asks for vendor/name only when missing")
+def _():
+    asked = []
+    def asker(q):
+        asked.append(q)
+        return "Vendor" if "Vendor" in q else "Blog"
+    out = edits.clarify("create a module", asker)
+    assert_true(len(asked) == 2, "should ask vendor + name")
+    assert_in("Vendor: Vendor", out)
+    assert_in("name: Blog", out)
+    asked.clear()
+    edits.clarify("create Vendor_Blog module", asker)
+    assert_true(asked == [], "should not ask when vendor+name already given")
+    asked.clear()
+    assert_true(edits.clarify("what is a module?", asker) == "what is a module?")
+    assert_true(asked == [], "questions must not trigger clarify")
+
+
+@test("edits._context includes the content of a referenced existing file")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-ctx-")
+    os.makedirs(os.path.join(d, "app/code/Vendor/Mod"))
+    with open(os.path.join(d, "app/code/Vendor/Mod/Foo.php"), "w") as f:
+        f.write("<?php\nclass Foo { public function bar() {} }\n")
+    assert_in("class Foo", edits._context("add a method to app/code/Vendor/Mod/Foo.php", d))
+    assert_in("class Foo", edits._context("edit Foo.php", d))   # basename resolves too
+    assert_true(edits._context("create a brand new module", d) == "")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("edits._apply_edit tolerates indentation and re-indents the replacement")
+def _():
+    cur = "class Foo\n{\n    public function a(): void\n    {\n    }\n}\n"
+    find = "public function a(): void\n{\n}"               # model dropped the indentation
+    repl = "public function a(): void\n{\n}\n\npublic function b(): void\n{\n}"
+    new = edits._apply_edit(cur, find, repl)
+    assert_true(new is not None, "fuzzy match should locate the method despite indentation")
+    assert_in("function b()", new)
+    assert_in("    public function b(): void", new)        # re-indented to the class body (4 spaces)
+    assert_true(edits._apply_edit("a=1", "a=1", "a=2") == "a=2")   # exact still works
+    assert_true(edits._apply_edit("xyz", "nope", "x") is None)     # unmatchable → None
+
+
+@test("undo reverts the last make (removes created, restores overwritten/deleted)")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-undo-")
+    os.makedirs(os.path.join(d, "app"))
+    open(os.path.join(d, "app/keep.php"), "w").write("ORIGINAL")
+    open(os.path.join(d, "app/gone.php"), "w").write("DELETE ME")
+    plan = [{"op": "create", "path": "app/new.php", "content": "NEW"},
+            {"op": "create", "path": "app/keep.php", "content": "OVERWRITTEN"},
+            {"op": "delete", "path": "app/gone.php"}]
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda task, root: plan
+    try:
+        edits.run_make("x", d, auto=True)
+    finally:
+        scaffold.generate_plan = orig
+    assert_true(os.path.isfile(os.path.join(d, "app/new.php")))
+    assert_true(open(os.path.join(d, "app/keep.php")).read().rstrip() == "OVERWRITTEN")  # apply adds \n
+    assert_true(not os.path.isfile(os.path.join(d, "app/gone.php")))
+
+    edits.undo(d)
+    assert_true(not os.path.isfile(os.path.join(d, "app/new.php")), "created file should be removed")
+    assert_true(open(os.path.join(d, "app/keep.php")).read() == "ORIGINAL", "overwrite must be restored")
+    assert_true(open(os.path.join(d, "app/gone.php")).read() == "DELETE ME", "deleted file must return")
+    assert_true(edits.undo(d) == 0, "second undo should find nothing")   # one level only
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("each project directory gets its own isolated index")
+def _():
+    a = tempfile.mkdtemp(prefix="magepilot-projA-")
+    b = tempfile.mkdtemp(prefix="magepilot-projB-")
+    open(os.path.join(a, "Alpha.php"), "w").write("<?php\nclass AlphaWidget { public function alpha() {} }\n")
+    open(os.path.join(b, "Beta.php"), "w").write("<?php\nclass BetaWidget { public function beta() {} }\n")
+    codebase_index.build_index(a, verbose=False)
+    codebase_index.build_index(b, verbose=False)
+    assert_in("Alpha.php", tools.search_code(a, "alpha widget", k=3))
+    assert_in("Beta.php", tools.search_code(b, "beta widget", k=3))
+    assert_true("Beta.php" not in tools.search_code(a, "beta widget", k=3), "A's index must not contain B's files")
+    assert_true(codebase_index.is_indexed(a) and codebase_index.is_indexed(b))
+    shutil.rmtree(a, ignore_errors=True)
+    shutil.rmtree(b, ignore_errors=True)
+
+
+@test("undo removes empty dirs it created but never structural/system dirs")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-undodir-")
+    os.makedirs(os.path.join(d, "generated/code/Vendor"))          # system dir — must stay
+    open(os.path.join(d, "generated/code/Vendor/x.php"), "w").write("compiled")
+    os.makedirs(os.path.join(d, "app/code"))                     # structural — pre-exists
+    plan = [{"op": "create", "path": "app/code/Vendor/Mod/registration.php", "content": "<?php"}]
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda t, r: plan
+    try:
+        edits.run_make("x", d, auto=True)
+    finally:
+        scaffold.generate_plan = orig
+    assert_true(os.path.isdir(os.path.join(d, "app/code/Vendor/Mod")))
+    edits.undo(d)
+    assert_true(not os.path.exists(os.path.join(d, "app/code/Vendor/Mod")), "empty created dir removed")
+    assert_true(not os.path.exists(os.path.join(d, "app/code/Vendor")), "empty created dir removed")
+    assert_true(os.path.isdir(os.path.join(d, "app/code")), "structural app/code must be KEPT")
+    assert_true(os.path.isfile(os.path.join(d, "generated/code/Vendor/x.php")), "generated/ must be untouched")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== v2 framework tests
+# ------------------------------------------------------------------ tool registry
+@test("registry holds all 8 built-in tools and renders the v1 catalog format")
+def _():
+    names = tools.REGISTRY.names()
+    for n in ("search_code", "grep", "read_file", "find_files", "list_dir",
+              "kb_search", "magento_cli", "sql_query"):
+        assert_in(n, names)
+    cat = tools.tool_catalog()
+    assert_in("- search_code: Semantic search over THIS project's indexed code", cat)
+    assert_in("- sql_query: Run a READ-ONLY SQL query", cat)
+
+
+@test("registry refuses duplicate tool names at registration")
+def _():
+    r = ToolRegistry()
+    t = Tool(name="x", description="d", fn=lambda ctx: "ok")
+    r.register(t)
+    assert_raises(ValueError, r.register, t)
+
+
+@test("permission gate: MUTATE tools are denied without an approver, run with one")
+def _():
+    r = ToolRegistry()
+    ran = []
+    r.register(Tool(name="writeish", description="d", risk=RiskLevel.MUTATE,
+                    primary="arg", fn=lambda ctx, arg=None: ran.append(arg) or "did it"))
+    out = r.dispatch(ToolContext(root="."), "writeish", "x")          # no approver → deny
+    assert_in("requires approval", out)
+    assert_true(ran == [], "denied tool must not run")
+    out = r.dispatch(ToolContext(root=".", approver=lambda t, a: "yes"), "writeish", "x")
+    assert_true(out == "did it" and ran == ["x"])
+    out = r.dispatch(ToolContext(root=".", approver=lambda t, a: "no"), "writeish", "y")
+    assert_in("requires approval", out)
+    assert_true(ran == ["x"], "declined tool must not run")
+
+
+@test("permission gate: READ tools never consult the approver")
+def _():
+    consulted = []
+    ctx = ToolContext(root=ROOT, approver=lambda t, a: consulted.append(t.name) or "no")
+    out = tools.REGISTRY.dispatch(ctx, "grep", "NoSuchEntityException")
+    assert_in("FaqRepository.php", out)
+    assert_true(consulted == [], "READ tools must not prompt")
+
+
+@test("Tool.json_schema converts params to a JSON Schema (the MCP path)")
+def _():
+    t = tools.REGISTRY.get("read_file")
+    schema = t.json_schema()
+    assert_true(schema["type"] == "object")
+    assert_true(schema["properties"]["path"]["type"] == "string")
+    assert_true(schema["properties"]["start"]["type"] == "integer")
+    assert_true(schema["required"] == ["path"], f"got {schema['required']}")
+
+
+# ------------------------------------------------------------------ config loader
+@test("config loader: defaults give a local provider and v1 role mapping, no cloud")
+def _():
+    orig = config_loader.USER_CONFIG
+    config_loader.USER_CONFIG = os.path.join(_TMP, "nonexistent.toml")
+    try:
+        cfg = config_loader.load()
+    finally:
+        config_loader.USER_CONFIG = orig
+    assert_true(set(cfg.providers) == {"local"}, "default config must contain NO cloud providers")
+    assert_true(cfg.providers["local"].is_remote is False)
+    assert_true(cfg.roles["executor"] == "local:auto")
+    assert_true(cfg.roles["coder"] == "local:magento")
+    assert_true(cfg.roles["planner"] == "@executor")
+
+
+@test("config loader: project file overrides user file, env overrides both")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-cfg-")
+    user_toml = os.path.join(d, "user.toml")
+    open(user_toml, "w").write('[roles]\nplanner = "local:user-model"\nreviewer = "local:rev"\n'
+                               '[limits]\nmax_task_steps = 5\n')
+    proj = os.path.join(d, "proj")
+    os.makedirs(proj)
+    open(os.path.join(proj, ".magepilot.toml"), "w").write('[roles]\nplanner = "local:proj-model"\n')
+    orig = config_loader.USER_CONFIG
+    config_loader.USER_CONFIG = user_toml
+    env_orig = os.environ.pop("MODEL_SERVER", None)
+    try:
+        cfg = config_loader.load(proj)
+        assert_true(cfg.roles["planner"] == "local:proj-model", "project file must beat user file")
+        assert_true(cfg.roles["reviewer"] == "local:rev", "user file keys survive when not overridden")
+        assert_true(cfg.limits.max_task_steps == 5)
+        os.environ["MODEL_SERVER"] = "http://127.0.0.1:9999/v1"
+        cfg2 = config_loader.load(proj)
+        assert_true(cfg2.providers["local"].base_url == "http://127.0.0.1:9999/v1", "env must beat files")
+    finally:
+        config_loader.USER_CONFIG = orig
+        os.environ.pop("MODEL_SERVER", None)
+        if env_orig is not None:
+            os.environ["MODEL_SERVER"] = env_orig
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ model router
+def _cfg(**roles) -> Config:
+    return Config(
+        providers={"local": ProviderCfg(name="local", base_url="http://127.0.0.1:8080/v1"),
+                   "anthropic": ProviderCfg(name="anthropic", type="anthropic")},
+        roles={"executor": "local:auto", **roles},
+    )
+
+
+@test("router resolves explicit mappings, @aliases, and falls back to executor")
+def _():
+    r = Router(_cfg(planner="@executor", coder="local:magento"))
+    p, m = r.resolve("coder")
+    assert_true(p.name == "local" and m == "magento")
+    p, m = r.resolve("planner")                       # alias → executor → local:auto
+    assert_true(p.name == "local" and m == "auto")
+    p, m = r.resolve("summarizer")                    # unmapped role → executor
+    assert_true(p.name == "local" and m == "auto")
+
+
+@test("router refuses alias cycles and unknown providers")
+def _():
+    r = Router(_cfg(planner="@reviewer", reviewer="@planner"))
+    assert_raises(RouterError, r.resolve, "planner")
+    r2 = Router(_cfg(planner="nope:model"))
+    assert_raises(RouterError, r2.resolve, "planner")
+
+
+@test("ProviderCfg.is_remote: localhost is local; cloud types and external hosts are remote")
+def _():
+    assert_true(ProviderCfg(name="a", base_url="http://127.0.0.1:8080/v1").is_remote is False)
+    assert_true(ProviderCfg(name="b", base_url="http://localhost:11434/v1").is_remote is False)
+    assert_true(ProviderCfg(name="c", base_url="https://api.example.com/v1").is_remote is True)
+    assert_true(ProviderCfg(name="d", type="anthropic").is_remote is True)
+
+
+@test("router model pinning: substring match, auto-pick avoids the fine-tune, strict errors")
+def _():
+    r = Router(_cfg())
+    ids = ["models/qwen2.5-coder-7b-magento-v4", "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"]
+    orig = llm_providers.loaded_models
+    llm_providers.loaded_models = lambda p: ids
+    try:
+        local = r.cfg.providers["local"]
+        assert_true(r._model_id(local, "magento") == ids[0], "substring match must hit the fine-tune")
+        assert_true(r._model_id(local, "auto") == ids[1], "auto must prefer base Instruct, not the fine-tune")
+        assert_true(r._model_id(local, "missing-model") == ids[1], "missing model substitutes the auto pick")
+        r.cfg.strict_models = True
+        assert_raises(RouterError, r._model_id, local, "missing-model")
+    finally:
+        llm_providers.loaded_models = orig
+        r.cfg.strict_models = False
+
+
+@test("cloud provider types raise a clear not-implemented error (Phase 6)")
+def _():
+    assert_raises(llm_providers.ProviderError, llm_providers.chat,
+                  ProviderCfg(name="anthropic", type="anthropic"), "claude-x",
+                  [{"role": "user", "content": "hi"}])
+
+
+# ================================================================== Phase 2: orchestrator
+class _NoModel:
+    """Stub router whose complete() always fails — forces deterministic fallbacks."""
+    def complete(self, *a, **k):
+        raise OSError("no model in tests")
+
+
+def _no_model():
+    return _NoModel()
+
+
+# ------------------------------------------------------------------ run state
+@test("run state: checkpoint round-trips atomically and lists newest first")
+def _():
+    t1 = run_state.Task(id=1, kind="edit", goal="g1", done_when="d1", note="n1", status="done")
+    t2 = run_state.Task(id=2, kind="verify", goal="g2", check={"files_exist": ["a.php"]})
+    st = run_state.RunState(run_id=run_state.new_run_id("Test Objective!"),
+                            objective="Test Objective!", root="/tmp/x", plan=[t1, t2])
+    run_state.save(st)
+    loaded = run_state.load(st.run_id)
+    assert_true(loaded.objective == st.objective and len(loaded.plan) == 2)
+    assert_true(loaded.plan[1].check == {"files_exist": ["a.php"]})
+    assert_true(loaded.next_pending().id == 2, "task 1 is done; next pending must be 2")
+    assert_in("[edit] g1: n1", loaded.notes_block())
+    d = run_state.run_dir(st.run_id)
+    assert_true(not [f for f in os.listdir(d) if f.endswith(".tmp")], "atomic write leaves no tmp")
+    rows = run_state.list_runs()
+    assert_true(rows and rows[0]["run_id"] >= rows[-1]["run_id"], "newest first")
+
+
+# ------------------------------------------------------------------ planner
+@test("planner template: module objective yields edit → command → files-exist verify")
+def _():
+    name, tasks = planner.plan("Create a Vendor_Faq module with an admin grid")
+    assert_true(name == "create_module", f"got template {name!r}")
+    kinds = [t.kind for t in tasks]
+    assert_true(kinds == ["edit", "command", "verify"], f"got {kinds}")
+    assert_true(tasks[1].command == "setup:upgrade")
+    assert_in("app/code/Vendor/Faq/registration.php", tasks[2].check["files_exist"])
+    assert_in("admin grid", tasks[0].goal)
+
+
+@test("planner templates match plugin / observer / theme / debug shapes")
+def _():
+    assert_true(planner.match_template("add a plugin to change the product price")[0] == "add_plugin")
+    assert_true(planner.match_template("create an observer for order placement")[0] == "add_observer")
+    assert_true(planner.match_template("create a Hyva theme Vendor_Demo")[0] == "create_theme")
+    assert_true(planner.match_template("fix this exception in checkout")[0] == "debug")
+    assert_true(planner.match_template("how does the cart total work?") is None,
+                "questions must fall through to the LLM/single-task path")
+
+
+@test("planner parses the numbered-line LLM format and extracts commands")
+def _():
+    text = ("1. [investigate] Find the order placement event | done: event identified\n"
+            "garbage line that should be ignored\n"
+            "2. [edit] Create the observer and events.xml | done: files created\n"
+            "3. [command] Run cache:clean config | done: exit 0\n")
+    tasks = planner.parse_llm_plan(text)
+    assert_true(len(tasks) == 3 and [t.kind for t in tasks] == ["investigate", "edit", "command"])
+    assert_true(tasks[0].done_when == "event identified")
+    assert_true(tasks[2].command == "cache:clean config", f"got {tasks[2].command!r}")
+    assert_true(planner.parse_llm_plan("no plan here at all") is None)
+    many = "\n".join(f"{i}. [verify] t{i} | done: d" for i in range(1, 10))
+    assert_true(len(planner.parse_llm_plan(many)) == planner.MAX_TASKS, "plans cap at MAX_TASKS")
+
+
+@test("planner degrades: LLM failure → single task; kind picked by heuristic")
+def _():
+    def boom(messages):
+        raise OSError("server down")
+    name, tasks = planner.plan("which class loads the wishlist sidebar?", complete=boom)
+    assert_true(name == "" and len(tasks) == 1 and tasks[0].kind == "investigate")
+    name, tasks = planner.plan("implement a wishlist sharing endpoint", complete=boom)
+    assert_true(len(tasks) == 1 and tasks[0].kind == "edit", "buildish objective → edit task")
+    parseable = "1. [investigate] look | done: found\n2. [edit] change | done: changed"
+    name, tasks = planner.plan("implement a wishlist sharing endpoint",
+                               complete=lambda m: parseable)
+    assert_true(len(tasks) == 2 and tasks[1].kind == "edit")
+
+
+# ------------------------------------------------------------------ compression
+@test("compress.extract_paths pulls file:line refs verbatim, deduped, in order")
+def _():
+    text = ("Found it in app/code/Vendor/Faq/Model/FaqRepository.php:42 and the wiring in "
+            "etc/di.xml. Also app/code/Vendor/Faq/Model/FaqRepository.php:42 again, plus "
+            "view/frontend/templates/list.phtml:7-19.")
+    paths = compress.extract_paths(text)
+    assert_true(paths[0] == "app/code/Vendor/Faq/Model/FaqRepository.php:42")
+    assert_true("etc/di.xml" in paths and "view/frontend/templates/list.phtml:7-19" in paths)
+    assert_true(len(paths) == 3, f"deduped — got {paths}")
+
+
+@test("compress.task_note: short text passes through; long text falls back with refs intact")
+def _():
+    short = "The plugin is wired in etc/di.xml:9."
+    assert_true(compress.task_note("g", short) == short)
+    orig = compress.get_router
+    compress.get_router = _no_model
+    try:
+        long = ("blah " * 200) + " the key file is app/code/V/M/Plugin/X.php:88 " + ("blah " * 60)
+        note = compress.task_note("g", long)
+        assert_true(len(note) <= compress.NOTE_MAX_CHARS + 200)
+        assert_in("app/code/V/M/Plugin/X.php:88", note, "verbatim path must survive compression")
+    finally:
+        compress.get_router = orig
+
+
+# ------------------------------------------------------------------ write tools
+@test("write tools are MUTATE/DANGEROUS and hidden from the default ReAct catalog")
+def _():
+    assert_true(tools.REGISTRY.get("write_file").risk is RiskLevel.MUTATE)
+    assert_true(tools.REGISTRY.get("delete_file").risk is RiskLevel.DANGEROUS)
+    cat = tools.tool_catalog()
+    assert_true("write_file" not in cat and "delete_file" not in cat,
+                "default catalog must stay READ-only (v1 prompt unchanged)")
+    assert_in("write_file", tools.REGISTRY.catalog(include_mutating=True))
+
+
+@test("write tools apply with approval, accumulate one undo journal, and undo reverts")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-wt-")
+    ctx = ToolContext(root=d, approver=lambda t, a: "yes")
+    out = tools.REGISTRY.dispatch(ctx, "write_file",
+                                  '{"path": "app/A.php", "content": "<?php // a"}')
+    assert_in("wrote", out)
+    out = tools.REGISTRY.dispatch(ctx, "write_file",
+                                  '{"path": "app/B.php", "content": "<?php // b"}')
+    assert_in("wrote", out)
+    out = tools.REGISTRY.dispatch(ctx, "edit_file",
+                                  '{"path": "app/A.php", "find": "// a", "replace": "// A!"}')
+    assert_in("edited", out)
+    import json as _json
+    journal = _json.load(open(config.UNDO_FILE))
+    assert_true(len(journal["ops"]) == 3, f"3 reverses accumulated, got {len(journal['ops'])}")
+    edits.undo(d)
+    assert_true(not os.path.exists(os.path.join(d, "app/A.php")), "undo removes created files")
+    assert_true(not os.path.exists(os.path.join(d, "app/B.php")))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("delete_file is DANGEROUS: denied without an approver, runs with explicit yes")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-del-")
+    open(os.path.join(d, "x.php"), "w").write("x")
+    out = tools.REGISTRY.dispatch(ToolContext(root=d), "delete_file", "x.php")
+    assert_in("requires approval", out)
+    assert_true(os.path.isfile(os.path.join(d, "x.php")))
+    out = tools.REGISTRY.dispatch(ToolContext(root=d, approver=lambda t, a: "yes"),
+                                  "delete_file", "x.php")
+    assert_in("deleted", out)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ orchestrator loop
+def _stub_module_plan(task, root):
+    return [
+        {"op": "create", "path": "app/code/Vendor/Faq/registration.php",
+         "content": "<?php // registration"},
+        {"op": "create", "path": "app/code/Vendor/Faq/etc/module.xml",
+         "content": "<config/>"},
+    ]
+
+
+@test("loop e2e (no model): template plan runs — edit applied, command skipped, verify passes")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-loop-")
+    orig_gen, orig_router = scaffold.generate_plan, compress.get_router
+    scaffold.generate_plan = _stub_module_plan
+    compress.get_router = _no_model
+    try:
+        run = loop.start("Create a Vendor_Faq module with an admin grid", d)
+        assert_true(run.template == "create_module")
+        run = loop.run_loop(run, auto=True, verbose=False, limits=LimitsCfg())
+    finally:
+        scaffold.generate_plan, compress.get_router = orig_gen, orig_router
+    assert_true(run.status == "done", f"got {run.status}: " +
+                "; ".join(f"{t.kind}={t.status}" for t in run.plan))
+    statuses = {t.kind: t.status for t in run.plan}
+    assert_true(statuses["edit"] == "done")
+    assert_true(statuses["command"] == "skipped", "no bin/magento → graceful skip, not failure")
+    assert_true(statuses["verify"] == "done")
+    assert_true(os.path.isfile(os.path.join(d, "app/code/Vendor/Faq/registration.php")))
+    assert_true(run.answer, "FINISH must produce a summary even without a model")
+    events = open(os.path.join(run_state.run_dir(run.run_id), "events.jsonl")).read()
+    assert_in('"plan"', events)
+    assert_in('"finish"', events)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("loop resume: a paused run continues from its pending task to done")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-resume-")
+    open(os.path.join(d, "done.php"), "w").write("x")
+    plan = [run_state.Task(id=1, kind="edit", goal="already finished", status="done",
+                           note="created done.php"),
+            run_state.Task(id=2, kind="verify", goal="confirm the file exists",
+                           check={"files_exist": ["done.php"]})]
+    paused = run_state.RunState(run_id=run_state.new_run_id("resume test"),
+                                objective="resume test", root=d, plan=plan, status="paused")
+    run_state.save(paused)
+    orig_router = compress.get_router
+    compress.get_router = _no_model
+    try:
+        run = loop.resume(paused.run_id)
+        assert_true(run.status == "running")
+        run = loop.run_loop(run, auto=True, verbose=False, limits=LimitsCfg())
+    finally:
+        compress.get_router = orig_router
+    assert_true(run.status == "done" and run.plan[1].status == "done",
+                f"got {run.status} / {run.plan[1].status}")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("loop budgets and cancellation: zero step budget → budget; pre-set cancel → paused")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-budget-")
+    orig_router = compress.get_router
+    compress.get_router = _no_model
+    try:
+        run = loop.start("Create a Vendor_Faq module please", d)
+        run = loop.run_loop(run, auto=True, verbose=False,
+                            limits=LimitsCfg(max_total_steps=0))
+        assert_true(run.status == "budget", f"got {run.status}")
+
+        import threading
+        ev = threading.Event()
+        ev.set()
+        run2 = loop.start("Create a Vendor_Faq module please", d)
+        run2 = loop.run_loop(run2, auto=True, verbose=False, cancel=ev, limits=LimitsCfg())
+        assert_true(run2.status == "paused", f"got {run2.status}")
+        assert_true(run2.next_pending() is not None, "paused run keeps its pending tasks")
+        reloaded = run_state.load(run2.run_id)
+        assert_true(reloaded.status == "paused", "pause must be checkpointed to disk")
+    finally:
+        compress.get_router = orig_router
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== Phase 3: knowledge graph
+from magepilot.graph import queries as gq                             # noqa: E402
+from magepilot.graph.build import build as build_graph                # noqa: E402
+from magepilot.graph.store import get_graph, graph_path               # noqa: E402
+from magepilot.memory.store import MemoryStore, project_store         # noqa: E402
+from magepilot.memory import recall as mem_recall                     # noqa: E402
+from magepilot.review import reviewer                                 # noqa: E402
+from magepilot.safety import scan as safety_scan                      # noqa: E402
+from magepilot.safety.lint_magento import lint_content                # noqa: E402
+
+
+@test("graph build: fixture module, classes, and Magento edges all land")
+def _():
+    counts = build_graph(ROOT, verbose=False)
+    assert_true(counts["errors"] == 0, f"parse errors: {counts['errors']}")
+    g = get_graph(ROOT)
+    try:
+        mods = [r["name"] for r in g.db.execute("SELECT name FROM modules")]
+        assert_in("Vendor_Faq", mods)
+        kinds = {r["kind"]: r["n"] for r in g.db.execute(
+            "SELECT kind, COUNT(*) n FROM nodes GROUP BY kind")}
+        assert_true(kinds.get("class", 0) >= 5 and kinds.get("interface", 0) >= 1, str(kinds))
+        edges = {r["kind"] for r in g.db.execute("SELECT DISTINCT kind FROM edges")}
+        for k in ("PREFERS", "PLUGS_INTO", "PLUGS_METHOD", "OBSERVES", "DISPATCHES",
+                  "INJECTS", "IMPLEMENTS", "DI_ARGUMENT", "DEPENDS_ON_MODULE"):
+            assert_in(k, edges)
+        assert_true(g.get_meta("build_state") == "complete")
+    finally:
+        g.close()
+
+
+@test("graph incremental: unchanged rerun touches nothing; edits and deletes propagate")
+def _():
+    c1 = build_graph(ROOT, verbose=False)
+    assert_true(c1["changed"] == 0 and c1["deleted"] == 0,
+                f"no-op rerun must be clean, got {c1['changed']}/{c1['deleted']}")
+    extra = os.path.join(ROOT, "Model", "Tmp.php")
+    open(extra, "w").write("<?php\nnamespace Vendor\\Faq\\Model;\nclass Tmp {}\n")
+    try:
+        c2 = build_graph(ROOT, verbose=False)
+        assert_true(c2["changed"] == 1, f"got {c2['changed']}")
+        g = get_graph(ROOT)
+        assert_true(g.db.execute("SELECT 1 FROM nodes WHERE qname='Vendor\\Faq\\Model\\Tmp'")
+                    .fetchone() is not None)
+        g.close()
+    finally:
+        os.remove(extra)
+    c3 = build_graph(ROOT, verbose=False)
+    assert_true(c3["deleted"] == 1, f"got {c3['deleted']}")
+    g = get_graph(ROOT)
+    assert_true(g.db.execute("SELECT 1 FROM nodes WHERE qname='Vendor\\Faq\\Model\\Tmp'")
+                .fetchone() is None, "deleted file's nodes must cascade away")
+    g.close()
+
+
+@test("graph: find_symbol + class_info resolve names, parents, and injections")
+def _():
+    g = get_graph(ROOT)
+    try:
+        hits = gq.find_symbol(g, "FaqRepository")
+        assert_true(hits and hits[0].qname == "Vendor\\Faq\\Model\\FaqRepository", str(hits[:2]))
+        info = gq.class_info(g, "Vendor\\Faq\\Model\\FaqRepository")
+        assert_in("Vendor\\Faq\\Api\\FaqRepositoryInterface", info.implements)
+        assert_true(any(t == "Vendor\\Faq\\Model\\ResourceModel\\Faq\\CollectionFactory"
+                        for _, t in info.injects), str(info.injects))
+        assert_in("getById", " ".join(info.methods))
+        # fuzzy: split-word FTS finds the repository from natural phrasing
+        fuzzy = gq.find_symbol(g, "faq repository")
+        assert_true(any("FaqRepository" in r.qname for r in fuzzy), str(fuzzy[:3]))
+    finally:
+        g.close()
+
+
+@test("graph: plugins_for sees the global plugin AND the frontend area disable")
+def _():
+    g = get_graph(ROOT)
+    try:
+        plugs = gq.plugins_for(g, "Magento\\Catalog\\Model\\Product")
+        assert_true(len(plugs) == 1, str(plugs))
+        p = plugs[0]
+        assert_true(p.plugin_fqcn == "Vendor\\Faq\\Plugin\\AddSurcharge")
+        assert_true(p.disabled is True and p.area == "frontend",
+                    f"frontend disable must override global: {p}")
+        # the broken plugin is found on the concrete class, with the method mismatch flagged
+        plugs2 = gq.plugins_for(g, "Vendor\\Faq\\Model\\FaqRepository")
+        assert_true(any(pl.plugin_fqcn.endswith("BrokenPlugin") for pl in plugs2), str(plugs2))
+        broken = next(pl for pl in plugs2 if pl.plugin_fqcn.endswith("BrokenPlugin"))
+        assert_true(any(m[1] == "fetchAll" and m[2] is False for m in broken.methods),
+                    f"mismatch must be flagged: {broken.methods}")
+    finally:
+        g.close()
+
+
+@test("graph: preference, observers + dispatch site, and impact counts are exact")
+def _():
+    g = get_graph(ROOT)
+    try:
+        prefs = gq.preference_for(g, "Vendor\\Faq\\Api\\FaqRepositoryInterface")
+        assert_true(len(prefs) == 1 and prefs[0]["impl"] == "Vendor\\Faq\\Model\\FaqRepository"
+                    and prefs[0]["winner"], str(prefs))
+        obs, disp = gq.observers_of(g, "faq_save_after")
+        assert_true(len(obs) == 1 and obs[0].observer_fqcn == "Vendor\\Faq\\Observer\\InvalidateCache",
+                    str(obs))
+        assert_true(any("FaqManager::save" in d for d in disp),
+                    f"dispatch site must be found: {disp}")
+        imp = gq.impact_of(g, "Vendor\\Faq\\Api\\FaqRepositoryInterface")
+        rels = imp["relations"]
+        assert_true(rels["implementors"]["count"] == 1, str(rels))
+        assert_true(rels["injectors"]["count"] == 1 and
+                    "FaqManager" in rels["injectors"]["examples"][0], str(rels))
+        assert_true(rels["preferences"]["count"] == 1, str(rels))
+    finally:
+        g.close()
+
+
+@test("graph: diagnose_plugin catches method typos and cross-file disables")
+def _():
+    g = get_graph(ROOT)
+    try:
+        d1 = gq.diagnose_plugin(g, "Vendor\\Faq\\Plugin\\BrokenPlugin")
+        assert_true(any("METHOD MISMATCH" in f and "fetchAll" in f for f in d1["findings"]),
+                    str(d1["findings"]))
+        d2 = gq.diagnose_plugin(g, "Vendor\\Faq\\Plugin\\AddSurcharge")
+        assert_true(any("DISABLED ELSEWHERE" in f and "frontend" in f for f in d2["findings"]),
+                    f"the frontend disable must be attributed: {d2['findings']}")
+        d3 = gq.diagnose_plugin(g, "Vendor\\Faq\\Plugin\\Nonexistent")
+        assert_true(any("NOT DECLARED" in f for f in d3["findings"]))
+    finally:
+        g.close()
+
+
+@test("graph tools: registry dispatch answers wiring questions; missing graph degrades")
+def _():
+    out = tools.run_tool(ROOT, "wiring", "Magento\\Catalog\\Model\\Product")
+    assert_in("AddSurcharge", out)
+    assert_in("DISABLED", out)
+    out = tools.run_tool(ROOT, "wiring", '{"target": "faq_save_after", "aspect": "observers"}')
+    assert_in("InvalidateCache", out)
+    out = tools.run_tool(ROOT, "symbol", "FaqManager")
+    assert_in("Vendor\\Faq\\Model\\FaqManager", out)
+    out = tools.run_tool(ROOT, "diagnose_plugin", "Vendor\\Faq\\Plugin\\BrokenPlugin")
+    assert_in("METHOD MISMATCH", out)
+    d = tempfile.mkdtemp(prefix="magepilot-nograph-")
+    assert_in("not built", tools.run_tool(d, "impact", "Some\\Class"))
+    shutil.rmtree(d, ignore_errors=True)
+    # grep's empty-result hint points at the graph once it exists
+    hint = tools.grep(ROOT, "TotallyAbsentSymbolXyz")
+    assert_in("symbol", hint)
+
+
+# ================================================================== Phase 3: memory
+@test("memory store: dedupe, keyword search, touch, and LRU eviction cap")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mem-")
+    m = MemoryStore(os.path.join(d, "memory.db"), cap=5)
+    for i in range(6):
+        m.add(f"filler fact number {i} about nothing")
+    assert_true(m.all_count() <= 5, f"cap must hold, got {m.all_count()}")
+    a = m.add("checkout totals collected in app/code/V/M/Model/Total/Fee.php", source="run-1")
+    assert_true(m.add("checkout totals collected in app/code/V/M/Model/Total/Fee.php") == a,
+                "identical facts must dedupe")
+    hits = m.search("where are checkout totals computed")
+    assert_true(hits and "Total/Fee.php" in hits[0]["content"], str([h['content'] for h in hits]))
+    m.touch([hits[0]["id"]])
+    assert_true(m.db.execute("SELECT uses FROM facts WHERE id=?", (hits[0]["id"],))
+                .fetchone()[0] == 1)
+    m.close()
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("memory: run-end facts persist and the NEXT run recalls them")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mem2-")
+    orig_gen, orig_router = scaffold.generate_plan, compress.get_router
+    scaffold.generate_plan = _stub_module_plan
+    compress.get_router = _no_model
+    try:
+        r1 = loop.start("Create a Vendor_Faq module with an admin grid", d)
+        r1 = loop.run_loop(r1, auto=True, verbose=False, limits=LimitsCfg())
+        assert_true(r1.status == "done")
+        ms = project_store(d)
+        n = ms.all_count()
+        ms.close()
+        assert_true(n >= 1, f"finished run must persist facts, got {n}")
+        r2 = loop.start("extend the Vendor_Faq module with a new admin grid column", d)
+        assert_true(r2.memory_block, "second run must recall first run's facts")
+        assert_in("Known project facts", r2.memory_block)
+    finally:
+        scaffold.generate_plan, compress.get_router = orig_gen, orig_router
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("memory tools: remember saves a project fact; recall_memory finds it")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mem3-")
+    out = tools.run_tool(d, "remember", "the FAQ grid lives in view/adminhtml/ui_component/faq_listing.xml")
+    assert_in("remembered", out)
+    out = tools.run_tool(d, "recall_memory", "where is the faq grid defined")
+    assert_in("faq_listing.xml", out)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== Phase 3: lint + scan
+@test("every MP rule fires on its sample and stays quiet on clean code")
+def _():
+    samples = {
+        "MP001": ("X.php", "<?php $om = \\Magento\\Framework\\App\\ObjectManager::getInstance();"),
+        "MP002": ("X.php", "<?php $id = $_GET['id'];"),
+        "MP003": ("X.php", "<?php exec('ls -la');"),
+        "MP004": ("X.php", "<?php $data = unserialize($raw);"),
+        "MP005": ("X.php", "<?php $conn->query(\"SELECT * FROM t WHERE id=\" . $id);"),
+        "MP006": ("Config.php", "<?php $apiKey = 'sk_live_abcDEF123456789xyz';"),
+        "MP008": ("etc/di.xml", "<config><preference for=\"A\" type=\"B\"/></config>"),
+        "MP009": ("view.phtml", "<p><?= $block->getName(); ?></p>"),
+        "MP010": ("X.php", "<?php foreach ($ids as $id) { $p = $factory->create()->load($id); }"),
+        "MP011": ("Patch.php", "<?php $sql = 'CREATE TABLE vendor_faq (id INT)';"),
+        "MP012": ("view.phtml", "<script>el.innerHTML = userContent;</script>"),
+        "MP013": ("X.php", "<?php die('boom');"),
+        "MP014": ("X.php", "<?php $ch = curl_init($url);"),
+        "MP015": ("X.php", "<?php\nnamespace V\\M;\nclass X {}"),
+    }
+    for rule_id, (path, content) in samples.items():
+        ids = [f.rule_id for f in lint_content(path, content)]
+        assert_in(rule_id, ids, f"{rule_id} must fire on its sample (got {ids})")
+    clean = ("<?php\ndeclare(strict_types=1);\nnamespace Vendor\\Faq\\Model;\n"
+             "class Clean { public function __construct(private readonly \\Psr\\Log\\LoggerInterface $l) {} }\n")
+    findings = [f for f in lint_content("Clean.php", clean) if f.severity != "info"]
+    assert_true(findings == [], f"clean code must pass: {[(f.rule_id, f.message) for f in findings]}")
+    esc = "<p><?= $escaper->escapeHtml($name) ?></p>"
+    assert_true(not any(f.rule_id == "MP009" for f in lint_content("v.phtml", esc)),
+                "escaped output must not trigger MP009")
+
+
+@test("scan_op: path policy blocks vendor//generated//env.php; edits lint the new text")
+def _():
+    for path in ("vendor/magento/module-catalog/Model/X.php", "generated/code/Y.php",
+                 "app/etc/env.php"):
+        f = safety_scan.scan_op({"op": "create", "path": path, "content": "<?php // x"})
+        assert_true(any(x.rule_id == "MP007" and x.severity == "block" for x in f),
+                    f"{path} must be write-blocked")
+    f = safety_scan.scan_op({"op": "edit", "path": "app/code/V/M/X.php",
+                             "find": "old", "replace": "$d = unserialize($raw);"})
+    assert_true(any(x.rule_id == "MP004" for x in f), "edit replace-text must be linted")
+    assert_true(not any(x.rule_id == "MP015" for x in f),
+                "a fragment can't carry declare() — MP015 must not fire on edits")
+
+
+@test("run_make refuses BLOCK-lint content even in full-auto; reports why")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-block-")
+    bad_plan = [{"op": "create", "path": "app/code/V/M/Bad.php",
+                 "content": "<?php $om = \\Magento\\Framework\\App\\ObjectManager::getInstance();"},
+                {"op": "create", "path": "app/code/V/M/Good.php",
+                 "content": "<?php\ndeclare(strict_types=1);\nnamespace V\\M;\nclass Good {}"}]
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda t, r: bad_plan
+    try:
+        res = edits.run_make("x", d, auto=True)
+    finally:
+        scaffold.generate_plan = orig
+    assert_true(not os.path.exists(os.path.join(d, "app/code/V/M/Bad.php")),
+                "BLOCK content must never reach disk")
+    assert_true(os.path.isfile(os.path.join(d, "app/code/V/M/Good.php")))
+    assert_true(res["blocked"] and "MP001" in res["blocked"][0]["reasons"][0], str(res["blocked"]))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("write_file tool refuses secrets and protected paths")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-wsec-")
+    ctx = ToolContext(root=d, approver=lambda t, a: "yes")
+    out = tools.REGISTRY.dispatch(ctx, "write_file",
+                                  '{"path": "app/code/V/M/K.php", "content": "<?php $apiKey = \'sk_live_abcDEF123456789xyz\';"}')
+    assert_in("MP006", out)
+    assert_true(not os.path.exists(os.path.join(d, "app/code/V/M/K.php")))
+    out = tools.REGISTRY.dispatch(ctx, "write_file",
+                                  '{"path": "vendor/x/y/Z.php", "content": "<?php // x"}')
+    assert_in("MP007", out)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== Phase 3: review
+@test("reviewer parses ISSUE lines, discards garbage, handles NO ISSUES and downtime")
+def _():
+    sample = ("Here are my findings:\n"
+              "ISSUE: app/code/V/M/X.php:10 [sec] high unescaped output — use $escaper->escapeHtml()\n"
+              "random prose that is not an issue line\n"
+              "ISSUE: app/code/V/M/Y.php:5 [perf] low collection not page-bounded\n")
+    issues = reviewer.parse_issues(sample)
+    assert_true(len(issues) == 2 and issues[0].category == "sec" and issues[0].line == 10,
+                str(issues))
+    assert_true(reviewer.review_diff("diff --git a b", complete=lambda m: "NO ISSUES") == [])
+    assert_true(reviewer.review_diff("diff --git a b",
+                                     complete=lambda m: (_ for _ in ()).throw(OSError("down")))
+                is None, "unreachable model → None (caller reports gracefully)")
+    assert_true(reviewer.review_diff("") == [], "empty diff → no issues, no model call")
+
+
+# ================================================================== Phase 4: git + debug
+import subprocess as _sp                                              # noqa: E402
+
+from magepilot.debug import stacktrace as dbg                         # noqa: E402
+
+# A realistic DI-compilation failure (the acceptance trace).
+DI_TRACE = """PHP Fatal error:  Uncaught ReflectionException: Class "Vendor\\Faq\\Plugin\\Missing" does not exist in /var/www/html/vendor/magento/framework/Code/Reader/ClassReader.php:33
+Stack trace:
+#0 /var/www/html/vendor/magento/framework/Code/Reader/ClassReader.php(33): ReflectionClass->__construct('Vendor\\\\Faq\\\\Plug...')
+#1 /var/www/html/vendor/magento/framework/ObjectManager/Definition/Runtime.php(54): Magento\\Framework\\Code\\Reader\\ClassReader->getConstructor('Vendor\\\\Faq\\\\Plug...')
+#2 /var/www/html/app/code/Vendor/Faq/Model/FaqManager.php(22): Magento\\Framework\\ObjectManager\\Definition\\Runtime->getParameters('Vendor\\\\Faq\\\\Plug...')
+#3 {main}
+  thrown in /var/www/html/vendor/magento/framework/Code/Reader/ClassReader.php on line 33"""
+
+
+def _make_repo(d: str) -> None:
+    for args in (["init", "-q", "-b", "main"],
+                 ["config", "user.email", "test@example.test"],
+                 ["config", "user.name", "Test"]):
+        _sp.run(["git", "-C", d, *args], capture_output=True, check=True)
+
+
+@test("git READ tools: status, log, diff, blame on a real temp repo")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-git-")
+    _make_repo(d)
+    open(os.path.join(d, "a.php"), "w").write("<?php\n$a = 1;\n")
+    _sp.run(["git", "-C", d, "add", "."], capture_output=True)
+    _sp.run(["git", "-C", d, "commit", "-qm", "first commit"], capture_output=True)
+    open(os.path.join(d, "a.php"), "a").write("$b = 2;\n")
+    assert_in("main", tools.run_tool(d, "git_status", ""))
+    assert_in("a.php", tools.run_tool(d, "git_status", ""))
+    assert_in("first commit", tools.run_tool(d, "git_log", ""))
+    assert_in("+$b = 2;", tools.run_tool(d, "git_diff", "a.php"))
+    assert_in("Test", tools.run_tool(d, "git_blame", '{"path": "a.php", "start": 2, "end": 2}'))
+    assert_raises(tools.ToolError, __import__("magepilot.tools.gitops", fromlist=["git_blame"])
+                  .git_blame, d, "../outside.php")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("git MUTATE tools are approval-gated; branch/add/commit work end-to-end; no push exists")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-gitw-")
+    _make_repo(d)
+    open(os.path.join(d, "x.php"), "w").write("<?php\n")
+    out = tools.REGISTRY.dispatch(ToolContext(root=d), "git_commit", "no approver")
+    assert_in("requires approval", out)
+    ctx = ToolContext(root=d, approver=lambda t, a: "yes")
+    assert_in("feature/faq", tools.REGISTRY.dispatch(
+        ctx, "git_branch", "feature/faq").lower().replace("switched to a new branch 'feature/faq'", "feature/faq"))
+    assert_in("staged", tools.REGISTRY.dispatch(ctx, "git_add", "x.php"))
+    out = tools.REGISTRY.dispatch(ctx, "git_commit", "add x")
+    assert_in("add x", out)
+    log = tools.run_tool(d, "git_log", "")
+    assert_in("add x", log)
+    # branch-name injection refused; push doesn't exist at all
+    out = tools.REGISTRY.dispatch(ctx, "git_branch", "bad name; rm -rf /")
+    assert_in("invalid branch name", out)
+    assert_true(tools.REGISTRY.get("git_push") is None, "there must be NO push tool in v1")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("parse_trace handles #N frames, thrown-in, inline file:line, and dedupes")
+def _():
+    p = dbg.parse_trace(DI_TRACE)
+    assert_true(p["exception"] == "ReflectionException", str(p["exception"]))
+    assert_in("does not exist", p["message"])
+    files = [f["file"] for f in p["frames"]]
+    assert_true(files[0].endswith("ClassReader.php") and p["frames"][0]["line"] == 33,
+                "thrown-in site must be frame 0")
+    assert_true(len([f for f in files if f.endswith("ClassReader.php")]) == 1, "deduped")
+    assert_true(any(f.endswith("FaqManager.php") for f in files))
+    inline = dbg.parse_trace("main.CRITICAL: Error: boom in /srv/app/code/V/M/X.php:99")
+    assert_true(inline["frames"] and inline["frames"][0]["line"] == 99)
+    assert_true(dbg.parse_trace("nothing here")["frames"] == [])
+
+
+@test("analyze flags the app/code frame as culprit, relativizes foreign paths, hints DI")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-dbg-")
+    out = dbg.analyze(d, DI_TRACE)
+    assert_in("exception: ReflectionException", out)
+    assert_in("app/code/Vendor/Faq/Model/FaqManager.php:22", out)
+    assert_in("most likely culprit", out)
+    culprit_line = next(ln for ln in out.splitlines() if "culprit" in ln)
+    assert_in("FaqManager", culprit_line, "the culprit must be the app/code frame, not vendor")
+    assert_in("hint:", out)
+    assert_in("symbol", out, "a does-not-exist failure must point at the graph tools")
+    assert_in("next: read_file app/code/Vendor/Faq/Model/FaqManager.php", out)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("magento_logs tails the newest entries and refuses unknown log names")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-logs-")
+    os.makedirs(os.path.join(d, "var", "log"))
+    with open(os.path.join(d, "var", "log", "exception.log"), "w") as f:
+        for i in range(1, 4):
+            f.write(f"[2026-06-1{i}T08:00:00.000000+00:00] main.CRITICAL: boom {i} "
+                    f"in /srv/app/code/V/M/X.php:{i}\nStack trace:\n#0 {{main}}\n")
+    out = tools.run_tool(d, "magento_logs", '{"log": "exception.log", "n": 2}')
+    assert_in("boom 2", out)
+    assert_in("boom 3", out)
+    assert_true("boom 1" not in out, "only the last n entries")
+    assert_in("error:", tools.run_tool(d, "magento_logs", "../../etc/passwd"))
+    assert_in("does not exist", tools.run_tool(d, "magento_logs", "system.log"))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("debug plan template routes through stack_trace / magento_logs / graph tools")
+def _():
+    name, tasks = planner.plan("fix this error: " + DI_TRACE.splitlines()[0]
+                               + "\n#0 /var/www/html/app/code/V/M/X.php(10): foo()")
+    assert_true(name == "debug")
+    assert_in("stack_trace", tasks[0].goal, "trace present → parse it first")
+    assert_in("diagnose_plugin", tasks[1].goal)
+    name2, tasks2 = planner.plan("debug why checkout is broken on the live site")
+    assert_true(name2 == "debug")
+    assert_in("magento_logs", tasks2[0].goal, "no trace → pull the logs first")
+
+
+# ---- regressions found by the Phase-4 live acceptance run
+@test("regression: a skipped no-op (delete of missing file) is NOT counted as applied")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-noop-")
+    plan = [{"op": "delete", "path": "app/code/V/M/Ghost.php"},
+            {"op": "create", "path": "app/code/V/M/Real.php", "content": "<?php\ndeclare(strict_types=1);"}]
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda t, r: plan
+    try:
+        res = edits.run_make("x", d, auto=True)
+    finally:
+        scaffold.generate_plan = orig
+    assert_true(len(res["applied"]) == 1 and res["applied"][0]["path"].endswith("Real.php"),
+                f"only the real write counts: {[o['path'] for o in res['applied']]}")
+    assert_true(any(o["path"].endswith("Ghost.php") for o in res["skipped"]))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("regression: NEEDS_REPLAN in a Final Answer is honored even when the answer parses")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-replan-")
+    plan = [run_state.Task(id=1, kind="verify", goal="confirm something impossible")]
+    run = run_state.RunState(run_id=run_state.new_run_id("replan test"),
+                             objective="replan test", root=d, plan=plan)
+    run_state.save(run)
+    orig_react, orig_replan, orig_router = loop.react.run, loop.planner.replan, compress.get_router
+    loop.react.run = lambda *a, **k: {"answer": "NEEDS_REPLAN: target cannot exist",
+                                      "steps": [], "stopped": "final", "scratchpad": ""}
+    loop.planner.replan = lambda *a, **k: None
+    compress.get_router = _no_model
+    try:
+        run = loop.run_loop(run, auto=True, verbose=False, limits=LimitsCfg())
+    finally:
+        loop.react.run, loop.planner.replan, compress.get_router = orig_react, orig_replan, orig_router
+    assert_true(run.status == "failed", f"NEEDS_REPLAN must never be 'done': {run.status}")
+    assert_true(run.plan[0].status == "failed", run.plan[0].status)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("regression: the ReAct format example is labeled, not an executable first step")
+def _():
+    ex = react_agent._example()
+    assert_in("Format example only", ex)
+    assert_in("NOT your task", ex)
+
+
+@test("regression: resuming a crashed run re-runs the task that was mid-flight")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-crash-")
+    open(os.path.join(d, "ok.php"), "w").write("x")
+    plan = [run_state.Task(id=1, kind="edit", goal="finished earlier", status="done", note="n"),
+            run_state.Task(id=2, kind="verify", goal="was mid-flight when the process died",
+                           status="running", attempts=1, check={"files_exist": ["ok.php"]})]
+    crashed = run_state.RunState(run_id=run_state.new_run_id("crash test"),
+                                 objective="crash test", root=d, plan=plan, status="running")
+    run_state.save(crashed)
+    orig_router = compress.get_router
+    compress.get_router = _no_model
+    try:
+        run = loop.resume(crashed.run_id)
+        assert_true(run.plan[1].status == "pending", "mid-flight task must be re-queued")
+        run = loop.run_loop(run, auto=True, verbose=False, limits=LimitsCfg())
+    finally:
+        compress.get_router = orig_router
+    assert_true(run.status == "done" and run.plan[1].status == "done",
+                f"{run.status} / {run.plan[1].status} — the interrupted task must actually run")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def main() -> int:
+    passed = failed = 0
+    print(f"running {len(_results)} deterministic tests (no model)\n")
+    for name, fn in _results:
+        try:
+            fn()
+            print(f"  \033[92mPASS\033[0m  {name}")
+            passed += 1
+        except Exception as e:
+            print(f"  \033[91mFAIL\033[0m  {name}\n        {e}")
+            if not isinstance(e, AssertionError):
+                traceback.print_exc()
+            failed += 1
+    shutil.rmtree(_TMP, ignore_errors=True)
+    print(f"\n{passed} passed, {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
