@@ -24,8 +24,9 @@ and implement BOTH methods with these exact signatures:
   public function fetch(\\Magento\\Quote\\Model\\Quote $quote, \\Magento\\Quote\\Model\\Quote\\Address\\Total $total): array
 
 collect() MUST call parent::collect($quote, $shippingAssignment, $total) first, then add the
-amount via $total->addTotalAmount('<code>', $amount) and $total->setBaseTotalAmount('<code>',
-$baseAmount) — never delegate to another collector and never leave $total unchanged.
+amount via $total->addTotalAmount('<code>', $amount) and $total->addBaseTotalAmount('<code>',
+$baseAmount) (or the setTotalAmount/setBaseTotalAmount variants) — never delegate to another
+collector and never leave $total unchanged.
 Register the collector in etc/sales.xml under section name="quote".
 === END FACTS ==="""
 
