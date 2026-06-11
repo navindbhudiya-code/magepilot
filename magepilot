@@ -33,7 +33,13 @@ die()  { echo "${c_red}✗${c_off} $*" >&2; exit 1; }
 
 need_venv() { [ -x "$VENV/bin/python" ] || die "environment missing — run: ./magepilot install"; }
 activate()  { need_venv; # shellcheck disable=SC1091
-              source "$VENV/bin/activate"; }
+              source "$VENV/bin/activate"
+              # self-heal after a `git pull`: older envs predate the magepilot package
+              python -c "import magepilot" 2>/dev/null || {
+                command -v uv >/dev/null 2>&1 || die "environment outdated — run: ./magepilot install"
+                info "updating environment (new package layout)…"
+                uv pip install -q -e "$ROOT" || die "package install failed — run: ./magepilot install"
+              }; }
 up() { curl -s -m 3 "http://127.0.0.1:$1/v1/models" >/dev/null 2>&1; }
 # MLX (the bundled model server) publishes wheels for Apple Silicon only. Elsewhere we
 # skip mlx-lm and the user points the stack at their own server via MODEL_SERVER.
