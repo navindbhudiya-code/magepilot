@@ -18,11 +18,14 @@ _TMP = tempfile.mkdtemp(prefix="magepilot-test-")
 config.CODE_CHROMA_PATH = os.path.join(_TMP, "code_index")
 config.ROOT_MARKER = os.path.join(config.CODE_CHROMA_PATH, "root.txt")
 config.UNDO_FILE = os.path.join(_TMP, "last_make.json")
+config.RUNS_DIR = os.path.join(_TMP, "runs")
 
 from magepilot import edits, tools                                    # noqa: E402
+from magepilot.agent import compress, loop, planner                   # noqa: E402
 from magepilot.agent import react as react_agent                      # noqa: E402
+from magepilot.agent import state as run_state                       # noqa: E402
 from magepilot.config import loader as config_loader                  # noqa: E402
-from magepilot.config.schema import Config, ProviderCfg               # noqa: E402
+from magepilot.config.schema import Config, LimitsCfg, ProviderCfg    # noqa: E402
 from magepilot.edits import scaffold                                  # noqa: E402
 from magepilot.index import codebase as codebase_index                # noqa: E402
 from magepilot.llm import providers as llm_providers                  # noqa: E402
@@ -631,6 +634,245 @@ def _():
     assert_raises(llm_providers.ProviderError, llm_providers.chat,
                   ProviderCfg(name="anthropic", type="anthropic"), "claude-x",
                   [{"role": "user", "content": "hi"}])
+
+
+# ================================================================== Phase 2: orchestrator
+class _NoModel:
+    """Stub router whose complete() always fails — forces deterministic fallbacks."""
+    def complete(self, *a, **k):
+        raise OSError("no model in tests")
+
+
+def _no_model():
+    return _NoModel()
+
+
+# ------------------------------------------------------------------ run state
+@test("run state: checkpoint round-trips atomically and lists newest first")
+def _():
+    t1 = run_state.Task(id=1, kind="edit", goal="g1", done_when="d1", note="n1", status="done")
+    t2 = run_state.Task(id=2, kind="verify", goal="g2", check={"files_exist": ["a.php"]})
+    st = run_state.RunState(run_id=run_state.new_run_id("Test Objective!"),
+                            objective="Test Objective!", root="/tmp/x", plan=[t1, t2])
+    run_state.save(st)
+    loaded = run_state.load(st.run_id)
+    assert_true(loaded.objective == st.objective and len(loaded.plan) == 2)
+    assert_true(loaded.plan[1].check == {"files_exist": ["a.php"]})
+    assert_true(loaded.next_pending().id == 2, "task 1 is done; next pending must be 2")
+    assert_in("[edit] g1: n1", loaded.notes_block())
+    d = run_state.run_dir(st.run_id)
+    assert_true(not [f for f in os.listdir(d) if f.endswith(".tmp")], "atomic write leaves no tmp")
+    rows = run_state.list_runs()
+    assert_true(rows and rows[0]["run_id"] >= rows[-1]["run_id"], "newest first")
+
+
+# ------------------------------------------------------------------ planner
+@test("planner template: module objective yields edit → command → files-exist verify")
+def _():
+    name, tasks = planner.plan("Create a Vendor_Faq module with an admin grid")
+    assert_true(name == "create_module", f"got template {name!r}")
+    kinds = [t.kind for t in tasks]
+    assert_true(kinds == ["edit", "command", "verify"], f"got {kinds}")
+    assert_true(tasks[1].command == "setup:upgrade")
+    assert_in("app/code/Vendor/Faq/registration.php", tasks[2].check["files_exist"])
+    assert_in("admin grid", tasks[0].goal)
+
+
+@test("planner templates match plugin / observer / theme / debug shapes")
+def _():
+    assert_true(planner.match_template("add a plugin to change the product price")[0] == "add_plugin")
+    assert_true(planner.match_template("create an observer for order placement")[0] == "add_observer")
+    assert_true(planner.match_template("create a Hyva theme Vendor_Demo")[0] == "create_theme")
+    assert_true(planner.match_template("fix this exception in checkout")[0] == "debug")
+    assert_true(planner.match_template("how does the cart total work?") is None,
+                "questions must fall through to the LLM/single-task path")
+
+
+@test("planner parses the numbered-line LLM format and extracts commands")
+def _():
+    text = ("1. [investigate] Find the order placement event | done: event identified\n"
+            "garbage line that should be ignored\n"
+            "2. [edit] Create the observer and events.xml | done: files created\n"
+            "3. [command] Run cache:clean config | done: exit 0\n")
+    tasks = planner.parse_llm_plan(text)
+    assert_true(len(tasks) == 3 and [t.kind for t in tasks] == ["investigate", "edit", "command"])
+    assert_true(tasks[0].done_when == "event identified")
+    assert_true(tasks[2].command == "cache:clean config", f"got {tasks[2].command!r}")
+    assert_true(planner.parse_llm_plan("no plan here at all") is None)
+    many = "\n".join(f"{i}. [verify] t{i} | done: d" for i in range(1, 10))
+    assert_true(len(planner.parse_llm_plan(many)) == planner.MAX_TASKS, "plans cap at MAX_TASKS")
+
+
+@test("planner degrades: LLM failure → single task; kind picked by heuristic")
+def _():
+    def boom(messages):
+        raise OSError("server down")
+    name, tasks = planner.plan("which class loads the wishlist sidebar?", complete=boom)
+    assert_true(name == "" and len(tasks) == 1 and tasks[0].kind == "investigate")
+    name, tasks = planner.plan("implement a wishlist sharing endpoint", complete=boom)
+    assert_true(len(tasks) == 1 and tasks[0].kind == "edit", "buildish objective → edit task")
+    parseable = "1. [investigate] look | done: found\n2. [edit] change | done: changed"
+    name, tasks = planner.plan("implement a wishlist sharing endpoint",
+                               complete=lambda m: parseable)
+    assert_true(len(tasks) == 2 and tasks[1].kind == "edit")
+
+
+# ------------------------------------------------------------------ compression
+@test("compress.extract_paths pulls file:line refs verbatim, deduped, in order")
+def _():
+    text = ("Found it in app/code/Vendor/Faq/Model/FaqRepository.php:42 and the wiring in "
+            "etc/di.xml. Also app/code/Vendor/Faq/Model/FaqRepository.php:42 again, plus "
+            "view/frontend/templates/list.phtml:7-19.")
+    paths = compress.extract_paths(text)
+    assert_true(paths[0] == "app/code/Vendor/Faq/Model/FaqRepository.php:42")
+    assert_true("etc/di.xml" in paths and "view/frontend/templates/list.phtml:7-19" in paths)
+    assert_true(len(paths) == 3, f"deduped — got {paths}")
+
+
+@test("compress.task_note: short text passes through; long text falls back with refs intact")
+def _():
+    short = "The plugin is wired in etc/di.xml:9."
+    assert_true(compress.task_note("g", short) == short)
+    orig = compress.get_router
+    compress.get_router = _no_model
+    try:
+        long = ("blah " * 200) + " the key file is app/code/V/M/Plugin/X.php:88 " + ("blah " * 60)
+        note = compress.task_note("g", long)
+        assert_true(len(note) <= compress.NOTE_MAX_CHARS + 200)
+        assert_in("app/code/V/M/Plugin/X.php:88", note, "verbatim path must survive compression")
+    finally:
+        compress.get_router = orig
+
+
+# ------------------------------------------------------------------ write tools
+@test("write tools are MUTATE/DANGEROUS and hidden from the default ReAct catalog")
+def _():
+    assert_true(tools.REGISTRY.get("write_file").risk is RiskLevel.MUTATE)
+    assert_true(tools.REGISTRY.get("delete_file").risk is RiskLevel.DANGEROUS)
+    cat = tools.tool_catalog()
+    assert_true("write_file" not in cat and "delete_file" not in cat,
+                "default catalog must stay READ-only (v1 prompt unchanged)")
+    assert_in("write_file", tools.REGISTRY.catalog(include_mutating=True))
+
+
+@test("write tools apply with approval, accumulate one undo journal, and undo reverts")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-wt-")
+    ctx = ToolContext(root=d, approver=lambda t, a: "yes")
+    out = tools.REGISTRY.dispatch(ctx, "write_file",
+                                  '{"path": "app/A.php", "content": "<?php // a"}')
+    assert_in("wrote", out)
+    out = tools.REGISTRY.dispatch(ctx, "write_file",
+                                  '{"path": "app/B.php", "content": "<?php // b"}')
+    assert_in("wrote", out)
+    out = tools.REGISTRY.dispatch(ctx, "edit_file",
+                                  '{"path": "app/A.php", "find": "// a", "replace": "// A!"}')
+    assert_in("edited", out)
+    import json as _json
+    journal = _json.load(open(config.UNDO_FILE))
+    assert_true(len(journal["ops"]) == 3, f"3 reverses accumulated, got {len(journal['ops'])}")
+    edits.undo(d)
+    assert_true(not os.path.exists(os.path.join(d, "app/A.php")), "undo removes created files")
+    assert_true(not os.path.exists(os.path.join(d, "app/B.php")))
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("delete_file is DANGEROUS: denied without an approver, runs with explicit yes")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-del-")
+    open(os.path.join(d, "x.php"), "w").write("x")
+    out = tools.REGISTRY.dispatch(ToolContext(root=d), "delete_file", "x.php")
+    assert_in("requires approval", out)
+    assert_true(os.path.isfile(os.path.join(d, "x.php")))
+    out = tools.REGISTRY.dispatch(ToolContext(root=d, approver=lambda t, a: "yes"),
+                                  "delete_file", "x.php")
+    assert_in("deleted", out)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ orchestrator loop
+def _stub_module_plan(task, root):
+    return [
+        {"op": "create", "path": "app/code/Vendor/Faq/registration.php",
+         "content": "<?php // registration"},
+        {"op": "create", "path": "app/code/Vendor/Faq/etc/module.xml",
+         "content": "<config/>"},
+    ]
+
+
+@test("loop e2e (no model): template plan runs — edit applied, command skipped, verify passes")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-loop-")
+    orig_gen, orig_router = scaffold.generate_plan, compress.get_router
+    scaffold.generate_plan = _stub_module_plan
+    compress.get_router = _no_model
+    try:
+        run = loop.start("Create a Vendor_Faq module with an admin grid", d)
+        assert_true(run.template == "create_module")
+        run = loop.run_loop(run, auto=True, verbose=False, limits=LimitsCfg())
+    finally:
+        scaffold.generate_plan, compress.get_router = orig_gen, orig_router
+    assert_true(run.status == "done", f"got {run.status}: " +
+                "; ".join(f"{t.kind}={t.status}" for t in run.plan))
+    statuses = {t.kind: t.status for t in run.plan}
+    assert_true(statuses["edit"] == "done")
+    assert_true(statuses["command"] == "skipped", "no bin/magento → graceful skip, not failure")
+    assert_true(statuses["verify"] == "done")
+    assert_true(os.path.isfile(os.path.join(d, "app/code/Vendor/Faq/registration.php")))
+    assert_true(run.answer, "FINISH must produce a summary even without a model")
+    events = open(os.path.join(run_state.run_dir(run.run_id), "events.jsonl")).read()
+    assert_in('"plan"', events)
+    assert_in('"finish"', events)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("loop resume: a paused run continues from its pending task to done")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-resume-")
+    open(os.path.join(d, "done.php"), "w").write("x")
+    plan = [run_state.Task(id=1, kind="edit", goal="already finished", status="done",
+                           note="created done.php"),
+            run_state.Task(id=2, kind="verify", goal="confirm the file exists",
+                           check={"files_exist": ["done.php"]})]
+    paused = run_state.RunState(run_id=run_state.new_run_id("resume test"),
+                                objective="resume test", root=d, plan=plan, status="paused")
+    run_state.save(paused)
+    orig_router = compress.get_router
+    compress.get_router = _no_model
+    try:
+        run = loop.resume(paused.run_id)
+        assert_true(run.status == "running")
+        run = loop.run_loop(run, auto=True, verbose=False, limits=LimitsCfg())
+    finally:
+        compress.get_router = orig_router
+    assert_true(run.status == "done" and run.plan[1].status == "done",
+                f"got {run.status} / {run.plan[1].status}")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("loop budgets and cancellation: zero step budget → budget; pre-set cancel → paused")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-budget-")
+    orig_router = compress.get_router
+    compress.get_router = _no_model
+    try:
+        run = loop.start("Create a Vendor_Faq module please", d)
+        run = loop.run_loop(run, auto=True, verbose=False,
+                            limits=LimitsCfg(max_total_steps=0))
+        assert_true(run.status == "budget", f"got {run.status}")
+
+        import threading
+        ev = threading.Event()
+        ev.set()
+        run2 = loop.start("Create a Vendor_Faq module please", d)
+        run2 = loop.run_loop(run2, auto=True, verbose=False, cancel=ev, limits=LimitsCfg())
+        assert_true(run2.status == "paused", f"got {run2.status}")
+        assert_true(run2.next_pending() is not None, "paused run keeps its pending tasks")
+        reloaded = run_state.load(run2.run_id)
+        assert_true(reloaded.status == "paused", "pause must be checkpointed to disk")
+    finally:
+        compress.get_router = orig_router
+    shutil.rmtree(d, ignore_errors=True)
 
 
 def main() -> int:

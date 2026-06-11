@@ -29,13 +29,16 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
-    def catalog(self, mode: str | None = None) -> str:
+    def catalog(self, mode: str | None = None, include_mutating: bool = False) -> str:
         """Human-readable tool list for the system prompt (v1 tool_catalog format).
 
-        `mode` filters in later phases (e.g. ask-mode hides MUTATE tools); Phase 1 has
-        only READ tools so every mode sees the full catalog.
+        READ-only by default: the ReAct executor's prompt stays exactly the v1 catalog
+        even though MUTATE write tools are registered — investigate/verify tasks must
+        not be offered writes. (`mode` adds finer filtering in Phase 5.)
         """
-        return "\n".join(f"- {t.name}: {t.description}" for t in self._tools.values())
+        return "\n".join(
+            f"- {t.name}: {t.description}" for t in self._tools.values()
+            if include_mutating or t.risk is RiskLevel.READ)
 
     def dispatch(self, ctx: ToolContext, name: str, arg: str) -> str:
         """Run one tool call. `arg` is the raw Action Input (JSON object or plain string)."""

@@ -83,6 +83,8 @@ HELP = f"""{B}Magepilot{X} — a local AI assistant for Magento 2 & Hyvä.
 
 # Command catalog — drives the `/` menu and Tab-completion.
 COMMANDS = [
+    ("/do", "<objective>", "plan + execute a multi-step objective (you approve each change)"),
+    ("/resume", "[run-id]", "continue a paused/interrupted run"),
     ("/make", "<task>", "create/edit files for a task (you approve each change)"),
     ("/undo", "", "revert the files changed by the last /make"),
     ("/index", "[path]", "index this project so /code can search it"),
@@ -304,6 +306,15 @@ def main() -> int:
             _need_root(state) and sh([PY, "-m", "magepilot", "run", "--root", state["root"], arg])
         elif cmd in ("make", "build", "scaffold", "edit"):
             _need_root(state) and sh([PY, "-m", "magepilot", "make", "--root", state["root"], arg])
+        elif cmd == "do":
+            if not arg:
+                print(f"{R}usage:{X} /do <objective>")
+            else:
+                _need_root(state) and sh([PY, "-m", "magepilot", "do", "--root", state["root"], arg])
+        elif cmd == "resume":
+            sh([PY, "-m", "magepilot", "resume"] + ([arg] if arg else []))
+        elif cmd == "runs":
+            sh([PY, "-m", "magepilot", "runs"])
         elif cmd in ("undo", "revert"):
             sh([PY, "-m", "magepilot", "undo"])   # reverts the last make (uses its recorded project)
         elif cmd == "sql":

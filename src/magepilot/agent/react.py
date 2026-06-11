@@ -21,6 +21,7 @@ malformed output (one nudge, then it returns whatever it has).
 import urllib.error
 
 from magepilot import config
+from magepilot.agent import compress
 from magepilot.llm.router import get_router
 from magepilot.tools import run_tool, tool_catalog
 from magepilot.tools.parsing import _ACTION_RE, _FINAL_RE, _first_arg  # noqa: F401 (v1 names)
@@ -78,22 +79,34 @@ def call_model(messages: list[dict], stop: list[str]) -> str:
     return get_router().complete("executor", messages, stop=stop, sampling=config.SAMPLING)
 
 
-def run(task: str, root: str, max_steps: int = None, verbose: bool = True) -> dict:
+def run(task: str, root: str, max_steps: int = None, verbose: bool = True, *,
+        system_addendum: str = "", initial_scratchpad: str = "",
+        on_step=None, cancel=None) -> dict:
     """Run the agent on `task` against the codebase at `root`.
 
-    Returns {"answer": str, "steps": [{thought, action, action_input, observation}], "stopped": str}.
+    Orchestrator hooks (all optional — v1 callers are unaffected):
+      system_addendum     extra system-prompt text (task goal/done_when, prior task notes)
+      initial_scratchpad  resume a checkpointed mid-task scratchpad
+      on_step(scratchpad, n_steps)  called after every tool step (checkpointing)
+      cancel              threading.Event-like; set → stop cleanly with stopped="cancelled"
+
+    Returns {"answer", "steps": [{thought, action, action_input, observation}],
+             "stopped", "scratchpad"}.
     """
     max_steps = max_steps or config.MAX_STEPS
-    scratchpad = ""
+    scratchpad = initial_scratchpad
     steps = []
     seen_calls = set()
     nudged = False
     rejected_finals = 0
     repeat_strikes = 0
+    system = _system_prompt() + (f"\n\n{system_addendum}" if system_addendum else "")
 
     for _ in range(max_steps):
+        if cancel is not None and cancel.is_set():
+            return {"answer": "", "steps": steps, "stopped": "cancelled", "scratchpad": scratchpad}
         messages = [
-            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": system},
             {"role": "user", "content": f"Question: {task}\n\nBegin.\n\n{_example() if not scratchpad else ''}{scratchpad}"},
         ]
         out = call_model(messages, stop=["Observation:", "<|im_end|>"]).strip()
@@ -114,7 +127,7 @@ def run(task: str, root: str, max_steps: int = None, verbose: bool = True) -> di
             answer = final.group(1).strip()
             if verbose:
                 print(f"\n\033[92mFinal Answer:\033[0m {answer}")
-            return {"answer": answer, "steps": steps, "stopped": "final"}
+            return {"answer": answer, "steps": steps, "stopped": "final", "scratchpad": scratchpad}
 
         m = _ACTION_RE.search(out)
         if not m:
@@ -122,7 +135,7 @@ def run(task: str, root: str, max_steps: int = None, verbose: bool = True) -> di
                 nudged = True
                 scratchpad += out + "\n(Reminder: respond with `Action:` + `Action Input:`, or `Final Answer:`.)\n"
                 continue
-            return {"answer": out.strip(), "steps": steps, "stopped": "unparsed"}
+            return {"answer": out.strip(), "steps": steps, "stopped": "unparsed", "scratchpad": scratchpad}
 
         thought = out[:m.start()].replace("Thought:", "").strip()
         action = m.group(1).strip().strip("`")
@@ -153,10 +166,14 @@ def run(task: str, root: str, max_steps: int = None, verbose: bool = True) -> di
 
         scratchpad += (f"Thought: {thought}\nAction: {action}\nAction Input: {action_input}\n"
                        f"Observation: {observation}\n")
+        if len(scratchpad) > compress.FOLD_THRESHOLD:
+            scratchpad = compress.fold_scratchpad(scratchpad)
+        if on_step is not None:
+            on_step(scratchpad, len(steps))
 
     # Out of steps — ask the model to summarize what it found.
     summary = _force_answer(task, scratchpad)
-    return {"answer": summary, "steps": steps, "stopped": "max_steps"}
+    return {"answer": summary, "steps": steps, "stopped": "max_steps", "scratchpad": scratchpad}
 
 
 def _force_answer(task: str, scratchpad: str) -> str:

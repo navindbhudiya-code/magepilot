@@ -171,6 +171,9 @@ ${c_green}Use${c_off}
   ./magepilot ask "<question>"            ask the grounded assistant
   ./magepilot index --root <store>        index a Magento codebase for the agent
   ./magepilot run "<task>"                ask the agent about the indexed codebase
+  ./magepilot do "<objective>"            plan + execute a multi-step objective (approve each change)
+  ./magepilot resume [run-id]             continue a paused/interrupted run
+  ./magepilot runs                        list recent runs
   ./magepilot make "<task>"               create/edit files for a task (approve each change)
   ./magepilot undo                        revert the files changed by the last make
   ./magepilot suggest --root <store>      propose & run the Magento commands your changes need
@@ -195,7 +198,7 @@ case "$cmd" in
   stop)               cmd_stop "$@" ;;
   status)             cmd_status "$@" ;;
   ask)                cmd_ask "$@" ;;
-  index|run|suggest|watch|sql|make|undo) cmd_agent "$cmd" "$@" ;;
+  index|run|suggest|watch|sql|make|undo|do|resume|runs) cmd_agent "$cmd" "$@" ;;
   help|-h|--help)     usage ;;
   *)                  warn "unknown command: $cmd"; echo; usage; exit 1 ;;
 esac

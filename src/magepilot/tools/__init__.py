@@ -5,7 +5,7 @@ re-exports the v1 module API (read_file, grep, run_tool, tool_catalog, …) so e
 callers and tests keep working unchanged.
 """
 from magepilot.safety.sandbox import _resolve_file, _safe_path          # noqa: F401 (v1 re-export)
-from magepilot.tools import fs as _fs, kb as _kb, magento as _magento, sql as _sql
+from magepilot.tools import fs as _fs, kb as _kb, magento as _magento, sql as _sql, write as _write
 from magepilot.tools.base import (                                       # noqa: F401
     Param, RiskLevel, Tool, ToolContext, ToolError, clip as _clip, root_tool,
 )
@@ -16,7 +16,7 @@ from magepilot.tools.parsing import _first_arg, _parse_args              # noqa:
 from magepilot.tools.registry import REGISTRY, ToolRegistry              # noqa: F401
 from magepilot.tools.sql import sql_query                                # noqa: F401
 
-for _mod in (_fs, _kb, _magento, _sql):
+for _mod in (_fs, _kb, _magento, _sql, _write):
     REGISTRY.register_many(_mod.TOOLS)
 
 

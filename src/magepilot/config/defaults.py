@@ -27,6 +27,9 @@ ROOT_MARKER = os.path.join(CODE_CHROMA_PATH, "last_root.txt")   # most-recent in
 # --- Undo journal: reverse ops for the last `make` (so /undo can revert it exactly) ---
 UNDO_FILE = os.path.join(CACHE_DIR, "last_make.json")
 
+# --- Agent runs: checkpoints + event transcripts for `do` / `resume` live here ---
+RUNS_DIR = os.path.join(CACHE_DIR, "runs")
+
 # --- Reuse the existing Magento knowledge base (facts) for the kb_search tool ---
 KB_CHROMA_PATH = os.path.join(REPO_ROOT, "rag", ".chroma")
 KB_COLLECTION = "magento_kb"

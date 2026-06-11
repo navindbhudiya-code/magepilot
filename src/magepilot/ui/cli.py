@@ -12,10 +12,13 @@
 """
 import argparse
 import os
+import signal
 import sys
+import threading
 import time
 
 from magepilot import config
+from magepilot.agent import loop, state
 from magepilot.agent.react import run as run_agent
 from magepilot.edits.apply import undo
 from magepilot.edits.scaffold import run_make
@@ -78,6 +81,30 @@ def _indent(text: str, pad: str = "        ") -> str:
     return "\n".join(pad + ln for ln in (text or "(no output)").splitlines()[:40])
 
 
+def _drive(run, *, auto: bool, quiet: bool) -> int:
+    """Run the orchestrator with two-stage Ctrl-C: first → finish the current call,
+    checkpoint, pause; second → hard exit (the last checkpoint is already on disk)."""
+    cancel = threading.Event()
+
+    def _sigint(signum, frame):
+        if cancel.is_set():
+            print("\n(hard exit — the run is checkpointed; resume with: "
+                  f"magepilot resume {run.run_id})", file=sys.stderr)
+            raise SystemExit(130)
+        cancel.set()
+        print("\n(pausing after the current step — Ctrl-C again to exit now)", file=sys.stderr)
+
+    prev = signal.signal(signal.SIGINT, _sigint)
+    try:
+        run = loop.run_loop(run, approver=_edit_approver if not auto else None,
+                            asker=None, auto=auto, cancel=cancel, verbose=not quiet)
+    finally:
+        signal.signal(signal.SIGINT, prev)
+    if quiet and run.answer:
+        print(run.answer)
+    return {"done": 0, "paused": 0, "budget": 0}.get(run.status, 1)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="magepilot", description="Magepilot — AI agent for Magento 2")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -114,6 +141,20 @@ def main(argv=None) -> int:
 
     p_undo = sub.add_parser("undo", help="revert the files changed by the last `make`")
     p_undo.add_argument("--root", help="override the project (defaults to where the last make ran)")
+
+    p_do = sub.add_parser("do", help="autonomously plan and execute a multi-step objective")
+    p_do.add_argument("objective", help="what to accomplish, e.g. 'create a Vendor_Faq module with an admin grid'")
+    p_do.add_argument("--root")
+    p_do.add_argument("--auto-approve", action="store_true",
+                      help="apply file changes and ASK-tier commands without asking")
+    p_do.add_argument("--quiet", action="store_true")
+
+    p_res = sub.add_parser("resume", help="resume a paused/interrupted run")
+    p_res.add_argument("run_id", nargs="?", help="run id (default: the most recent resumable run)")
+    p_res.add_argument("--auto-approve", action="store_true")
+    p_res.add_argument("--quiet", action="store_true")
+
+    sub.add_parser("runs", help="list recent agent runs")
 
     args = ap.parse_args(argv)
 
@@ -161,6 +202,36 @@ def main(argv=None) -> int:
 
     if args.cmd == "undo":
         undo(args.root)          # root optional — defaults to where the last make ran
+        return 0
+
+    if args.cmd == "do":
+        root = _resolve_root(args.root)
+        run = loop.start(args.objective, root)
+        print(f"run {run.run_id}" + (f"  (template: {run.template})" if run.template else ""))
+        return _drive(run, auto=args.auto_approve, quiet=args.quiet)
+
+    if args.cmd == "resume":
+        rid = args.run_id
+        if not rid:
+            resumable = [r for r in state.list_runs() if r["status"] in ("paused", "running")]
+            if not resumable:
+                print("no resumable runs.", file=sys.stderr)
+                return 1
+            rid = resumable[0]["run_id"]
+        run = loop.resume(rid)
+        if run.status not in ("running",):
+            print(f"run {rid} is '{run.status}' — nothing to resume.", file=sys.stderr)
+            return 1
+        print(f"resuming {rid}: {run.objective}")
+        return _drive(run, auto=args.auto_approve, quiet=args.quiet)
+
+    if args.cmd == "runs":
+        rows = state.list_runs()
+        if not rows:
+            print("no runs yet — start one with: magepilot do \"<objective>\"")
+            return 0
+        for r in rows[:20]:
+            print(f"{r['run_id']:<46} {r['status']:<8} {r['objective'][:60]}")
         return 0
 
     if args.cmd == "sql":
