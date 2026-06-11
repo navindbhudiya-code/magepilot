@@ -1,16 +1,17 @@
-"""Deterministic tests for the Magepilot agent — NO model required.
+"""Deterministic tests for MagePilot — NO model required.
 
 Covers the parts whose correctness must not depend on the LLM: the sandbox, every tool,
-the CLI whitelist, the ReAct parser, and code indexing + semantic search on a fixture module.
+the CLI whitelist, the ReAct parser, code indexing + semantic search on a fixture module,
+and (new in v2) the tool registry/permission gate, the config loader, and the model router.
 
-    python -m agent.tests.run_tests
+    python tests/run_tests.py
 """
 import os
 import shutil
 import tempfile
 import traceback
 
-from agent import config
+from magepilot import config
 
 # Redirect the code index to a throwaway dir BEFORE the collection is opened.
 _TMP = tempfile.mkdtemp(prefix="magepilot-test-")
@@ -18,7 +19,18 @@ config.CODE_CHROMA_PATH = os.path.join(_TMP, "code_index")
 config.ROOT_MARKER = os.path.join(config.CODE_CHROMA_PATH, "root.txt")
 config.UNDO_FILE = os.path.join(_TMP, "last_make.json")
 
-from agent import codebase_index, tools, react_agent, actions, suggest, db, edits  # noqa: E402
+from magepilot import edits, tools                                    # noqa: E402
+from magepilot.agent import react as react_agent                      # noqa: E402
+from magepilot.config import loader as config_loader                  # noqa: E402
+from magepilot.config.schema import Config, ProviderCfg               # noqa: E402
+from magepilot.edits import scaffold                                  # noqa: E402
+from magepilot.index import codebase as codebase_index                # noqa: E402
+from magepilot.llm import providers as llm_providers                  # noqa: E402
+from magepilot.llm.router import Router, RouterError                  # noqa: E402
+from magepilot.magento import db, suggest                             # noqa: E402
+from magepilot.safety import policy as actions                        # noqa: E402
+from magepilot.tools.base import Param, RiskLevel, Tool, ToolContext  # noqa: E402
+from magepilot.tools.registry import ToolRegistry                     # noqa: E402
 
 codebase_index._collections.clear()
 
@@ -330,13 +342,13 @@ def _():
     d = tempfile.mkdtemp(prefix="magepilot-make-")
     plan = [{"op": "create", "path": "keep.php", "content": "<?php // keep"},
             {"op": "create", "path": "skip.php", "content": "<?php // skip"}]
-    orig = edits.generate_plan
-    edits.generate_plan = lambda task, root: plan          # no model in tests
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda task, root: plan          # no model in tests
     try:
         decisions = iter(["yes", "no"])
         res = edits.run_make("x", d, approver=lambda op: next(decisions))
     finally:
-        edits.generate_plan = orig
+        scaffold.generate_plan = orig
     assert_true(os.path.isfile(os.path.join(d, "keep.php")), "approved file should exist")
     assert_true(not os.path.isfile(os.path.join(d, "skip.php")), "denied file must NOT exist")
     assert_true(len(res["applied"]) == 1 and len(res["skipped"]) == 1)
@@ -404,12 +416,12 @@ def _():
     plan = [{"op": "create", "path": "app/new.php", "content": "NEW"},
             {"op": "create", "path": "app/keep.php", "content": "OVERWRITTEN"},
             {"op": "delete", "path": "app/gone.php"}]
-    orig = edits.generate_plan
-    edits.generate_plan = lambda task, root: plan
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda task, root: plan
     try:
         edits.run_make("x", d, auto=True)
     finally:
-        edits.generate_plan = orig
+        scaffold.generate_plan = orig
     assert_true(os.path.isfile(os.path.join(d, "app/new.php")))
     assert_true(open(os.path.join(d, "app/keep.php")).read().rstrip() == "OVERWRITTEN")  # apply adds \n
     assert_true(not os.path.isfile(os.path.join(d, "app/gone.php")))
@@ -445,12 +457,12 @@ def _():
     open(os.path.join(d, "generated/code/Vendor/x.php"), "w").write("compiled")
     os.makedirs(os.path.join(d, "app/code"))                     # structural — pre-exists
     plan = [{"op": "create", "path": "app/code/Vendor/Mod/registration.php", "content": "<?php"}]
-    orig = edits.generate_plan
-    edits.generate_plan = lambda t, r: plan
+    orig = scaffold.generate_plan
+    scaffold.generate_plan = lambda t, r: plan
     try:
         edits.run_make("x", d, auto=True)
     finally:
-        edits.generate_plan = orig
+        scaffold.generate_plan = orig
     assert_true(os.path.isdir(os.path.join(d, "app/code/Vendor/Mod")))
     edits.undo(d)
     assert_true(not os.path.exists(os.path.join(d, "app/code/Vendor/Mod")), "empty created dir removed")
@@ -458,6 +470,167 @@ def _():
     assert_true(os.path.isdir(os.path.join(d, "app/code")), "structural app/code must be KEPT")
     assert_true(os.path.isfile(os.path.join(d, "generated/code/Vendor/x.php")), "generated/ must be untouched")
     shutil.rmtree(d, ignore_errors=True)
+
+
+# ================================================================== v2 framework tests
+# ------------------------------------------------------------------ tool registry
+@test("registry holds all 8 built-in tools and renders the v1 catalog format")
+def _():
+    names = tools.REGISTRY.names()
+    for n in ("search_code", "grep", "read_file", "find_files", "list_dir",
+              "kb_search", "magento_cli", "sql_query"):
+        assert_in(n, names)
+    cat = tools.tool_catalog()
+    assert_in("- search_code: Semantic search over THIS project's indexed code", cat)
+    assert_in("- sql_query: Run a READ-ONLY SQL query", cat)
+
+
+@test("registry refuses duplicate tool names at registration")
+def _():
+    r = ToolRegistry()
+    t = Tool(name="x", description="d", fn=lambda ctx: "ok")
+    r.register(t)
+    assert_raises(ValueError, r.register, t)
+
+
+@test("permission gate: MUTATE tools are denied without an approver, run with one")
+def _():
+    r = ToolRegistry()
+    ran = []
+    r.register(Tool(name="writeish", description="d", risk=RiskLevel.MUTATE,
+                    primary="arg", fn=lambda ctx, arg=None: ran.append(arg) or "did it"))
+    out = r.dispatch(ToolContext(root="."), "writeish", "x")          # no approver → deny
+    assert_in("requires approval", out)
+    assert_true(ran == [], "denied tool must not run")
+    out = r.dispatch(ToolContext(root=".", approver=lambda t, a: "yes"), "writeish", "x")
+    assert_true(out == "did it" and ran == ["x"])
+    out = r.dispatch(ToolContext(root=".", approver=lambda t, a: "no"), "writeish", "y")
+    assert_in("requires approval", out)
+    assert_true(ran == ["x"], "declined tool must not run")
+
+
+@test("permission gate: READ tools never consult the approver")
+def _():
+    consulted = []
+    ctx = ToolContext(root=ROOT, approver=lambda t, a: consulted.append(t.name) or "no")
+    out = tools.REGISTRY.dispatch(ctx, "grep", "NoSuchEntityException")
+    assert_in("FaqRepository.php", out)
+    assert_true(consulted == [], "READ tools must not prompt")
+
+
+@test("Tool.json_schema converts params to a JSON Schema (the MCP path)")
+def _():
+    t = tools.REGISTRY.get("read_file")
+    schema = t.json_schema()
+    assert_true(schema["type"] == "object")
+    assert_true(schema["properties"]["path"]["type"] == "string")
+    assert_true(schema["properties"]["start"]["type"] == "integer")
+    assert_true(schema["required"] == ["path"], f"got {schema['required']}")
+
+
+# ------------------------------------------------------------------ config loader
+@test("config loader: defaults give a local provider and v1 role mapping, no cloud")
+def _():
+    orig = config_loader.USER_CONFIG
+    config_loader.USER_CONFIG = os.path.join(_TMP, "nonexistent.toml")
+    try:
+        cfg = config_loader.load()
+    finally:
+        config_loader.USER_CONFIG = orig
+    assert_true(set(cfg.providers) == {"local"}, "default config must contain NO cloud providers")
+    assert_true(cfg.providers["local"].is_remote is False)
+    assert_true(cfg.roles["executor"] == "local:auto")
+    assert_true(cfg.roles["coder"] == "local:magento")
+    assert_true(cfg.roles["planner"] == "@executor")
+
+
+@test("config loader: project file overrides user file, env overrides both")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-cfg-")
+    user_toml = os.path.join(d, "user.toml")
+    open(user_toml, "w").write('[roles]\nplanner = "local:user-model"\nreviewer = "local:rev"\n'
+                               '[limits]\nmax_task_steps = 5\n')
+    proj = os.path.join(d, "proj")
+    os.makedirs(proj)
+    open(os.path.join(proj, ".magepilot.toml"), "w").write('[roles]\nplanner = "local:proj-model"\n')
+    orig = config_loader.USER_CONFIG
+    config_loader.USER_CONFIG = user_toml
+    env_orig = os.environ.pop("MODEL_SERVER", None)
+    try:
+        cfg = config_loader.load(proj)
+        assert_true(cfg.roles["planner"] == "local:proj-model", "project file must beat user file")
+        assert_true(cfg.roles["reviewer"] == "local:rev", "user file keys survive when not overridden")
+        assert_true(cfg.limits.max_task_steps == 5)
+        os.environ["MODEL_SERVER"] = "http://127.0.0.1:9999/v1"
+        cfg2 = config_loader.load(proj)
+        assert_true(cfg2.providers["local"].base_url == "http://127.0.0.1:9999/v1", "env must beat files")
+    finally:
+        config_loader.USER_CONFIG = orig
+        os.environ.pop("MODEL_SERVER", None)
+        if env_orig is not None:
+            os.environ["MODEL_SERVER"] = env_orig
+    shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ model router
+def _cfg(**roles) -> Config:
+    return Config(
+        providers={"local": ProviderCfg(name="local", base_url="http://127.0.0.1:8080/v1"),
+                   "anthropic": ProviderCfg(name="anthropic", type="anthropic")},
+        roles={"executor": "local:auto", **roles},
+    )
+
+
+@test("router resolves explicit mappings, @aliases, and falls back to executor")
+def _():
+    r = Router(_cfg(planner="@executor", coder="local:magento"))
+    p, m = r.resolve("coder")
+    assert_true(p.name == "local" and m == "magento")
+    p, m = r.resolve("planner")                       # alias → executor → local:auto
+    assert_true(p.name == "local" and m == "auto")
+    p, m = r.resolve("summarizer")                    # unmapped role → executor
+    assert_true(p.name == "local" and m == "auto")
+
+
+@test("router refuses alias cycles and unknown providers")
+def _():
+    r = Router(_cfg(planner="@reviewer", reviewer="@planner"))
+    assert_raises(RouterError, r.resolve, "planner")
+    r2 = Router(_cfg(planner="nope:model"))
+    assert_raises(RouterError, r2.resolve, "planner")
+
+
+@test("ProviderCfg.is_remote: localhost is local; cloud types and external hosts are remote")
+def _():
+    assert_true(ProviderCfg(name="a", base_url="http://127.0.0.1:8080/v1").is_remote is False)
+    assert_true(ProviderCfg(name="b", base_url="http://localhost:11434/v1").is_remote is False)
+    assert_true(ProviderCfg(name="c", base_url="https://api.example.com/v1").is_remote is True)
+    assert_true(ProviderCfg(name="d", type="anthropic").is_remote is True)
+
+
+@test("router model pinning: substring match, auto-pick avoids the fine-tune, strict errors")
+def _():
+    r = Router(_cfg())
+    ids = ["models/qwen2.5-coder-7b-magento-v4", "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"]
+    orig = llm_providers.loaded_models
+    llm_providers.loaded_models = lambda p: ids
+    try:
+        local = r.cfg.providers["local"]
+        assert_true(r._model_id(local, "magento") == ids[0], "substring match must hit the fine-tune")
+        assert_true(r._model_id(local, "auto") == ids[1], "auto must prefer base Instruct, not the fine-tune")
+        assert_true(r._model_id(local, "missing-model") == ids[1], "missing model substitutes the auto pick")
+        r.cfg.strict_models = True
+        assert_raises(RouterError, r._model_id, local, "missing-model")
+    finally:
+        llm_providers.loaded_models = orig
+        r.cfg.strict_models = False
+
+
+@test("cloud provider types raise a clear not-implemented error (Phase 6)")
+def _():
+    assert_raises(llm_providers.ProviderError, llm_providers.chat,
+                  ProviderCfg(name="anthropic", type="anthropic"), "claude-x",
+                  [{"role": "user", "content": "hi"}])
 
 
 def main() -> int:

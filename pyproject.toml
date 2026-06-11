@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magepilot"
+version = "0.2.0"
+description = "MagePilot — a local, privacy-first AI coding agent for Magento 2 & Hyvä"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "chromadb>=0.5",
+    "prompt_toolkit",
+    # mlx-lm pulls protobuf 7.x, which makes the resolver drop chromadb's otel exporter
+    # back to 1.11.1, whose generated _pb2 files crash on import under protobuf 7.
+    "protobuf<7",
+]
+
+[project.optional-dependencies]
+# MLX publishes wheels for Apple Silicon only; other platforms serve their own
+# OpenAI-compatible model (Ollama / llama.cpp / vLLM) and skip this extra.
+mlx = ["mlx-lm"]
+
+[project.scripts]
+# Named magepilot-agent (not magepilot) so `pip install -e .` never shadows the
+# bash dispatcher at the repo root on PATH.
+magepilot-agent = "magepilot.ui.cli:main"
+
+[project.entry-points."magepilot.tools"]
+# Third-party packages may register Tool providers here (loaded by the registry).
+
+[tool.setuptools.packages.find]
+where = ["src"]

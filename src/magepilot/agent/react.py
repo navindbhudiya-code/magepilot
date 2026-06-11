@@ -1,4 +1,7 @@
-"""#3 The agent loop — a ReAct controller (Reason + Act).
+"""The agent loop — a ReAct controller (Reason + Act). Migrated from agent/react_agent.py:
+the loop and every guard are unchanged; model access goes through the role router
+(role "executor" — the base Instruct model in the default local setup) and tool dispatch
+goes through the registry.
 
 The model is prompted to emit, each turn, either:
 
@@ -15,16 +18,12 @@ We stop generation at "Observation:" so the model can't hallucinate tool output,
 real tool, and continue. The loop is bounded by MAX_STEPS and degrades gracefully on
 malformed output (one nudge, then it returns whatever it has).
 """
-import json
-import re
 import urllib.error
-import urllib.request
 
-from agent import config
-from agent.tools import run_tool, tool_catalog
-
-_ACTION_RE = re.compile(r"Action\s*:\s*(.+?)\s*[\r\n]+\s*Action\s*Input\s*:\s*(.*)", re.S)
-_FINAL_RE = re.compile(r"Final\s*Answer\s*:\s*(.*)", re.S)
+from magepilot import config
+from magepilot.llm.router import get_router
+from magepilot.tools import run_tool, tool_catalog
+from magepilot.tools.parsing import _ACTION_RE, _FINAL_RE, _first_arg  # noqa: F401 (v1 names)
 
 
 def _system_prompt() -> str:
@@ -76,35 +75,15 @@ def _example() -> str:
 
 
 def call_model(messages: list[dict], stop: list[str]) -> str:
-    payload = {"model": _model_id(), "messages": messages, "stop": stop, **config.SAMPLING}
-    req = urllib.request.Request(
-        config.MODEL_SERVER + "/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=300) as r:
-        return json.load(r)["choices"][0]["message"]["content"]
+    return get_router().complete("executor", messages, stop=stop, sampling=config.SAMPLING)
 
 
-def _model_id() -> str:
-    """Pick the agent's reasoning model — the base Instruct model by default (best at tools)."""
-    try:
-        with urllib.request.urlopen(config.MODEL_SERVER + "/models", timeout=5) as r:
-            ids = [m["id"] for m in json.load(r)["data"]]
-    except Exception:
-        return config.AGENT_MODEL or "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
-    if config.AGENT_MODEL:
-        return next((m for m in ids if config.AGENT_MODEL in m), ids[0])
-    # auto: prefer the base Instruct model; avoid the style fine-tune for tool reasoning
-    base = next((m for m in ids if "Instruct" in m and "magento" not in m.lower()), None)
-    return base or ids[0]
-
-
-def run(task: str, root: str, max_steps: int = config.MAX_STEPS, verbose: bool = True) -> dict:
+def run(task: str, root: str, max_steps: int = None, verbose: bool = True) -> dict:
     """Run the agent on `task` against the codebase at `root`.
 
     Returns {"answer": str, "steps": [{thought, action, action_input, observation}], "stopped": str}.
     """
+    max_steps = max_steps or config.MAX_STEPS
     scratchpad = ""
     steps = []
     seen_calls = set()
@@ -178,24 +157,6 @@ def run(task: str, root: str, max_steps: int = config.MAX_STEPS, verbose: bool =
     # Out of steps — ask the model to summarize what it found.
     summary = _force_answer(task, scratchpad)
     return {"answer": summary, "steps": steps, "stopped": "max_steps"}
-
-
-def _first_arg(text: str) -> str:
-    """Keep just the tool input: a leading JSON object, else the first non-empty line."""
-    text = text.strip()
-    if text.startswith("{"):
-        depth, end = 0, None
-        for i, c in enumerate(text):
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        if end:
-            return text[:end]
-    return text.splitlines()[0].strip() if text.splitlines() else ""
 
 
 def _force_answer(task: str, scratchpad: str) -> str:

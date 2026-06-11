@@ -4,7 +4,7 @@ Walks the codebase, splits each source file into overlapping line-windows, embed
 window (MiniLM-ONNX, local/CPU) and upserts into a persistent Chroma collection. Chunk ids
 are a stable hash of (relpath + start_line), so re-indexing upserts in place (idempotent).
 
-Run:  python -m agent.cli index --root /path/to/magento
+Run:  python -m magepilot index --root /path/to/magento
 """
 import hashlib
 import os
@@ -12,7 +12,7 @@ import os
 import chromadb
 from chromadb.utils import embedding_functions
 
-from agent import config
+from magepilot import config
 
 # Each project (directory) gets its OWN index, stored under CODE_CHROMA_PATH/<hash-of-path>/.
 # So you can use magepilot in any folder and it keeps a separate index per project (like Claude Code).

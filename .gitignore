@@ -4,6 +4,9 @@ __pycache__/
 *.py[cod]
 .venv/
 .ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
 
 # ── macOS ──────────────────────────────────────────────────────────────────
 .DS_Store
@@ -88,6 +91,9 @@ website/
 
 # ── IDE settings ────────────────────────────────────────────────────────────
 .idea/
+
+# ── Internal architecture/design docs (kept locally, NOT pushed) ───────────
+docs/architecture/
 
 # ── Training runs (configs + adapter checkpoints; adapters released via HF) ──
 training/

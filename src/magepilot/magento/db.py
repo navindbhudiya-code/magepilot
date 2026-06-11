@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 
-from agent import config
+from magepilot import config
 
 _READONLY_START = re.compile(r"^\s*(select|show|describe|desc|explain)\b", re.I)
 _WRITE = re.compile(

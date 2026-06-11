@@ -1,8 +1,15 @@
-"""Central configuration for the Magepilot agent."""
+"""Default configuration constants for MagePilot (migrated from agent/config.py).
+
+These remain plain module-level names — tests and callers may rebind them on the
+`magepilot.config` package (which star-imports this module) and every consumer reads
+them at call time via `config.X`.
+"""
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(HERE)
+# src/magepilot/config/ → src/magepilot/ → src/ → repo root. MAGEPILOT_HOME overrides
+# (e.g. when the package is installed outside the checkout).
+REPO_ROOT = os.environ.get("MAGEPILOT_HOME") or os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 
 # --- Codebase under analysis (set via `--root` or AGENT_CODEBASE env) ---
 DEFAULT_CODEBASE = os.environ.get("AGENT_CODEBASE", "")

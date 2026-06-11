@@ -1,44 +1,29 @@
-"""Magepilot agent CLI.
+"""MagePilot agent CLI (migrated from agent/cli.py).
 
     # build / refresh the code index for a Magento codebase
-    python -m agent.cli index --root /path/to/magento
+    python -m magepilot index --root /path/to/magento
 
     # ask the agent about that codebase (root defaults to the last-indexed one)
-    python -m agent.cli run "Which plugin changes the product price, and where is it wired?"
+    python -m magepilot run "Which plugin changes the product price, and where is it wired?"
 
     # propose the Magento commands your uncommitted changes need, and run approved ones
-    python -m agent.cli suggest --root /path/to/magento
-    python -m agent.cli watch   --root /path/to/magento     # same, continuously, on file change
+    python -m magepilot suggest --root /path/to/magento
+    python -m magepilot watch   --root /path/to/magento     # same, continuously, on file change
 """
 import argparse
 import os
 import sys
 import time
 
-from agent import config
-from agent.actions import classify, execute
-from agent.codebase_index import build_index, indexed_root
-from agent.db import run_query
-from agent.edits import run_make, undo
-from agent.react_agent import run as run_agent
-from agent.suggest import git_changes, suggest
-
-
-def _edit_approver(op):
-    """Interactive y / n / all prompt for one file change."""
-    try:
-        ans = input(f"    {op['op']} {op['path']} — apply? [y]es / [n]o / [a]ll: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return "no"
-    return {"y": "yes", "yes": "yes", "a": "all", "all": "all"}.get(ans, "no")
-
-
-def _ask(question):
-    """Interactive prompt for a missing detail (e.g. vendor name)."""
-    try:
-        return input(question)
-    except (EOFError, KeyboardInterrupt):
-        return ""
+from magepilot import config
+from magepilot.agent.react import run as run_agent
+from magepilot.edits.apply import undo
+from magepilot.edits.scaffold import run_make
+from magepilot.index.codebase import build_index, indexed_root
+from magepilot.magento.db import run_query
+from magepilot.magento.suggest import git_changes, suggest
+from magepilot.safety.approval import ask as _ask, cli_approver as _cli_approver, edit_approver as _edit_approver
+from magepilot.safety.policy import classify, execute
 
 
 def _abs_root(arg_root: str | None) -> str | None:
@@ -59,15 +44,6 @@ def _resolve_root(arg_root: str | None) -> str:
     if not root:
         sys.exit("no codebase root. Pass --root <path> or set AGENT_CODEBASE, and run `index` first.")
     return root
-
-
-def _cli_approver(cmd: str, sub: str) -> str:
-    """Interactive y / n / always prompt for an ASK-tier command."""
-    try:
-        ans = input(f"    Run `bin/magento {cmd}` ? [y]es / [n]o / [a]lways: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return "no"
-    return {"y": "yes", "yes": "yes", "a": "always", "always": "always"}.get(ans, "no")
 
 
 def _run_suggestions(root: str, plan: bool, auto: bool, allow_always: set) -> int:

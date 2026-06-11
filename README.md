@@ -102,7 +102,7 @@ Only the bundled **model server** needs Apple Silicon — the **RAG layer and th
    - **Agent:** `export MODEL_SERVER=http://localhost:11434/v1` and `export AGENT_MODEL=qwen2.5-coder:7b`
      (use whatever id your server reports at `/v1/models`).
    - **RAG:** set `MODEL_SERVER` in `rag/config.py` to the same URL.
-3. Then use `python -m agent.cli …` and `python rag/ask.py …` exactly as in **Use it** below.
+3. Then use `python -m magepilot …` and `python rag/ask.py …` exactly as in **Use it** below.
 
 > **Note on the fine-tune:** the published weights are **MLX-only** for now, so on other platforms you run
 > the **base Qwen2.5-Coder**. You keep the full **agent** (it reasons on the base model anyway) and **RAG**

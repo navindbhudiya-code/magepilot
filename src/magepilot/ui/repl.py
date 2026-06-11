@@ -1,4 +1,4 @@
-"""Magepilot interactive shell — a Claude-Code-style REPL.
+"""MagePilot interactive shell — a Claude-Code-style REPL (migrated from agent/repl.py).
 
 Run it with no arguments (`./magepilot`) and you get a prompt: type a question for a
 grounded Magento answer, or use /slash commands for actions (install, serve, index, sql, …).
@@ -22,7 +22,9 @@ try:
 except ImportError:
     pass
 
-from agent.codebase_index import indexed_root, is_indexed
+from magepilot import config
+from magepilot.index.codebase import indexed_root, is_indexed
+from magepilot.llm import client as llm_client
 
 # Plain input that clearly asks to scaffold/modify files → route to the (approval-gated) make flow.
 _BUILD_RE = re.compile(
@@ -31,7 +33,7 @@ _BUILD_RE = re.compile(
     r"repository|cron|patch|widget|component|file|directory|folder|graphql|resolver|route|menu|"
     r"system\.xml|di\.xml|db_schema|webapi|email|class|interface)\b", re.I)
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = config.REPO_ROOT
 MAGEPILOT = os.path.join(ROOT, "magepilot")
 PY = sys.executable
 
@@ -179,41 +181,19 @@ def _ask_via_proxy(question: str) -> bool:
     The proxy keeps chromadb + the embedding model warm, so this skips ask.py's multi-second
     cold start and prints tokens as they arrive. Returns False when the proxy isn't reachable
     (or didn't produce an answer) so the caller can fall back to the ask.py subprocess."""
-    import json
-    import urllib.request
-    payload = {"model": "magento-rag", "stream": True,
-               "messages": [{"role": "user", "content": question}]}
-    req = urllib.request.Request("http://127.0.0.1:8090/v1/chat/completions",
-                                 data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    try:
-        resp = urllib.request.urlopen(req, timeout=300)
-    except OSError:
-        return False
     wrote = False
     try:
-        with resp:
-            for raw in resp:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    delta = json.loads(data)["choices"][0].get("delta", {})
-                except (ValueError, KeyError, IndexError):
-                    continue
-                chunk = delta.get("content") or ""
-                if chunk:
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
-                    wrote = True
+        for chunk in llm_client.stream("http://127.0.0.1:8090/v1", "magento-rag",
+                                       [{"role": "user", "content": question}]):
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            wrote = True
     except KeyboardInterrupt:
         print(f"\n{Y}(interrupted){X}")
         return True
     except OSError:
-        pass                       # stream dropped — whatever printed stands
+        if not wrote:
+            return False               # proxy unreachable — caller falls back to ask.py
     if wrote:
         print()
     return wrote
@@ -282,7 +262,7 @@ def main() -> int:
             if _BUILD_RE.search(line):                 # "create a Hyva theme …" → make files (you approve each)
                 if _need_root(state):
                     print(f"{Y}(creating files — you'll approve each change; Ctrl-C to cancel){X}")
-                    sh([PY, "-m", "agent.cli", "make", "--root", state["root"], line])
+                    sh([PY, "-m", "magepilot", "make", "--root", state["root"], line])
             elif not _server_running():
                 print(f"{Y}servers aren't running{X} — start them with {G}/serve{X}, then ask again")
             elif not _ask_via_proxy(line):             # fast path: stream via the warm RAG proxy
@@ -312,7 +292,7 @@ def main() -> int:
             path = os.path.abspath(os.path.expanduser(arg)) if arg else state["root"]
             if not path:
                 print(f"{R}usage:{X} /index <path-to-magento>")
-            elif sh([PY, "-m", "agent.cli", "index", "--root", path]) == 0:
+            elif sh([PY, "-m", "magepilot", "index", "--root", path]) == 0:
                 state["root"] = path
         elif cmd in ("use", "cd", "root"):
             if not arg:
@@ -321,17 +301,17 @@ def main() -> int:
                 state["root"] = os.path.abspath(os.path.expanduser(arg))
                 print(f"{Y}codebase:{X} {state['root']}")
         elif cmd in ("code", "agent", "run"):
-            _need_root(state) and sh([PY, "-m", "agent.cli", "run", "--root", state["root"], arg])
+            _need_root(state) and sh([PY, "-m", "magepilot", "run", "--root", state["root"], arg])
         elif cmd in ("make", "build", "scaffold", "edit"):
-            _need_root(state) and sh([PY, "-m", "agent.cli", "make", "--root", state["root"], arg])
+            _need_root(state) and sh([PY, "-m", "magepilot", "make", "--root", state["root"], arg])
         elif cmd in ("undo", "revert"):
-            sh([PY, "-m", "agent.cli", "undo"])   # reverts the last make (uses its recorded project)
+            sh([PY, "-m", "magepilot", "undo"])   # reverts the last make (uses its recorded project)
         elif cmd == "sql":
-            _need_root(state) and sh([PY, "-m", "agent.cli", "sql", "--root", state["root"], arg])
+            _need_root(state) and sh([PY, "-m", "magepilot", "sql", "--root", state["root"], arg])
         elif cmd == "suggest":
-            _need_root(state) and sh([PY, "-m", "agent.cli", "suggest", "--root", state["root"]])
+            _need_root(state) and sh([PY, "-m", "magepilot", "suggest", "--root", state["root"]])
         elif cmd == "watch":
-            _need_root(state) and sh([PY, "-m", "agent.cli", "watch", "--root", state["root"]])
+            _need_root(state) and sh([PY, "-m", "magepilot", "watch", "--root", state["root"]])
         else:
             print(f"{R}unknown command:{X} /{cmd}   —  /help")
 

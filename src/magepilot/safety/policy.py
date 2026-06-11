@@ -1,4 +1,5 @@
-"""Approval-gated command execution.
+"""Approval-gated command execution — the unified 3-tier policy engine (migrated from
+agent/actions.py). The same engine that gates shell commands gates MUTATE tools.
 
 Three tiers (the safety core):
   - AUTO    read-only commands run without asking (status/info).
@@ -15,7 +16,7 @@ import re
 import shutil
 import subprocess
 
-from agent import config
+from magepilot import config
 
 # read-only — run without asking (same set the agent's magento_cli tool allows)
 AUTO = set(config.MAGENTO_CLI_WHITELIST)

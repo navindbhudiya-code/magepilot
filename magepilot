@@ -50,13 +50,13 @@ cmd_install() {
   # import under protobuf 7 ("Descriptors cannot be created directly"). Capping protobuf at
   # <7 keeps protobuf 6.x + a modern (1.42.x) otel stack, so chromadb imports cleanly.
   if is_apple_silicon; then
-    info "installing dependencies (mlx-lm, chromadb, prompt_toolkit)…"
-    uv pip install -q mlx-lm chromadb prompt_toolkit 'protobuf<7'
+    info "installing magepilot + dependencies (mlx-lm, chromadb, prompt_toolkit)…"
+    uv pip install -q -e "$ROOT[mlx]"
   else
     warn "not Apple Silicon — skipping mlx-lm (MLX is Apple-Silicon only)."
     warn "serve a model yourself and export MODEL_SERVER (see README's Linux/Windows section)."
-    info "installing dependencies (chromadb, prompt_toolkit)…"
-    uv pip install -q chromadb prompt_toolkit 'protobuf<7'
+    info "installing magepilot + dependencies (chromadb, prompt_toolkit)…"
+    uv pip install -q -e "$ROOT"
   fi
   info "building the Magento knowledge base…"
   python "$ROOT/rag/ingest.py" >/dev/null
@@ -141,7 +141,7 @@ cmd_stop() {
   pkill -f "mlx_lm.server --model $MODEL" 2>/dev/null || true
   pkill -f "rag/rag_server.py"        2>/dev/null || true
   pkill -f "rag/ask.py"               2>/dev/null || true
-  pkill -f "agent\.cli"               2>/dev/null || true
+  pkill -f "[-]m magepilot (index|run|suggest|watch|sql|make|undo)" 2>/dev/null || true
   ok "stopped."
 }
 
@@ -152,7 +152,7 @@ cmd_status() {
 
 # ----------------------------------------------------------------------------- use
 cmd_ask()     { activate; python "$ROOT/rag/ask.py" "$@"; }
-cmd_agent()   { activate; cd "$ROOT"; python -m agent.cli "$@"; }   # index|run|suggest|watch|sql
+cmd_agent()   { activate; cd "$ROOT"; python -m magepilot "$@"; }   # index|run|suggest|watch|sql
 
 usage() {
   cat <<EOF
@@ -189,7 +189,7 @@ EOF
 # ----------------------------------------------------------------------------- dispatch
 cmd="${1:-chat}"; shift || true
 case "$cmd" in
-  chat)               activate; cd "$ROOT"; exec python -m agent.repl ;;   # interactive shell (default)
+  chat)               activate; cd "$ROOT"; exec python -m magepilot ;;    # interactive shell (default)
   install)            cmd_install "$@" ;;
   serve|start)        cmd_serve "$@" ;;
   stop)               cmd_stop "$@" ;;
