@@ -5,7 +5,7 @@
 <h1 align="center">Magepilot 🧙</h1>
 
 <p align="center"><b>A local, self-hostable AI coding agent for Magento&nbsp;2 &amp; Hyvä</b><br/>
-<sub>writes idiomatic code · inspects your real codebase · creates &amp; edits files (you approve each) · runs <code>bin/magento</code> · debugs the DB — all on your machine</sub></p>
+<sub>plans &amp; executes multi-step objectives · knows your DI/plugin/observer wiring exactly · writes idiomatic code · creates &amp; edits files (you approve each) · debugs stack traces, git history &amp; the DB — all on your machine</sub></p>
 
 <p align="center">
   <a href="https://huggingface.co/navindbhudiya/qwen2.5-coder-7b-magento-v2"><img alt="model" src="https://img.shields.io/badge/%F0%9F%A4%97%20model-Qwen2.5--Coder--Magento-yellow"></a>
@@ -59,6 +59,18 @@ Open a new terminal afterwards so `magepilot` is picked up. Then you can run it 
 
 ## What it does
 
+- 🤖 **Executes multi-step objectives autonomously** — `magepilot do "create a Vendor_Faq module with an
+  admin grid"` plans the tasks (investigate → edit → command → verify), runs them with per-change approval,
+  and **checkpoints every step**: Ctrl-C pauses, `magepilot resume` continues exactly where it left off,
+  `magepilot runs` lists past runs.
+- 🕸️ **Knows your Magento wiring exactly** — `magepilot graph` builds a **knowledge graph** of your whole
+  store (DI preferences, plugin chains with sortOrder/area/disabled, observers, dispatch sites, constructor
+  injections — vendor/ included, ~50s for a full 2.4 store). The agent then answers *"what plugins intercept
+  this method?"*, *"what breaks if I change this interface?"* and *"why is my plugin not firing?"* from
+  facts, not grep — including cross-module disables (the MSI-style case text search can never find).
+- 🐛 **Debugs from a stack trace** — paste a PHP error into `magepilot do` and it parses the frames, flags
+  the culprit (your code before vendor code), reads `var/log/*.log`, root-causes DI/plugin failures via the
+  graph, and proposes the smallest fix.
 - 💬 **Grounded answers** — idiomatic Magento 2 + Hyvä code, with facts grounded by a knowledge base (RAG)
   so it doesn't make up APIs.
 - 🔍 **Understands your codebase** — `/index` builds a **per-project** semantic index; `/code` answers from
@@ -72,6 +84,14 @@ Open a new terminal afterwards so `magepilot` is picked up. Then you can run it 
   commands and runs the ones you approve; `make` offers to run follow-ups like `setup:upgrade`.
 - 🗄️ **Read-only DB debugging** — `/sql` queries the store database (Warden / Docker auto-detected); every
   write is refused.
+- 🧹 **A Magento linter guards every write** — 15 deterministic rules (no `ObjectManager`, no SQL
+  concatenation, no secrets, escaped output, no loads-in-loops, …) run **before** you're even asked to
+  approve; rule-breaking code never reaches disk, and `vendor/`, `generated/`, `app/etc/env.php` are
+  write-blocked outright. `magepilot review` runs an advisory AI review over your uncommitted diff.
+- 🌿 **Git-aware** — the agent reads status/diff/log/blame to understand recent changes, and can branch +
+  commit **with your approval**. There is deliberately **no push capability**: nothing leaves your machine.
+- 🧠 **Remembers your project** — durable facts from each session (file roles, decisions, gotchas) are
+  recalled in the next one, so the agent doesn't rediscover your architecture every time.
 - 🖥️ **Interactive or scriptable** — run `magepilot` in any project folder (the current directory *is* the
   project), or use any command directly (`magepilot make …`, `magepilot sql …`).
 - 🔒 **Safe & private** — every write and command is **approval-gated and sandboxed** to the project; the
@@ -143,6 +163,8 @@ magepilot> /help        # every command            /exit
 | Inside the shell | What it does |
 |------------------|--------------|
 | *just type a question* | grounded Magento answer (RAG + model) |
+| `/do <objective>` | **plan + execute a multi-step objective** — approve each change; pause/resume any time |
+| `/resume` · `/runs` | continue a paused/interrupted run · list recent runs |
 | `/make <task>` | **create/edit files** for a task — previews each change, you approve `y`/`n`/`all` |
 | `/undo` | **revert the last `/make`** — restores every file it touched |
 | `/index` | index the current project so `/code` can search it (re-run after big changes) |
@@ -171,10 +193,14 @@ Every command also works **non-interactively** — run from the project director
 ```bash
 cd ~/PhpstormProjects/my-store
 magepilot ask "When do I use a plugin vs a preference?"
+magepilot do "create a Vendor_Faq module with an admin grid"  # plan + execute, approving each change
+magepilot resume                      # continue a paused/interrupted run (also: magepilot runs)
+magepilot graph                       # build the Magento knowledge graph (DI/plugins/observers, incl. vendor/)
 magepilot make "a Hyva theme Demo with parent Hyva/default"   # creates files (use --plan to preview only)
 magepilot undo                        # revert the last make
 magepilot index                       # index the current project
 magepilot run "Which class throws NoSuchEntityException, and why?"
+magepilot review                      # advisory AI review of your uncommitted diff
 magepilot suggest                     # commands for your uncommitted changes
 magepilot sql "SELECT entity_id, sku FROM catalog_product_entity LIMIT 20"
 ```
@@ -207,8 +233,9 @@ Read-only only (`SELECT` / `SHOW` / `DESCRIBE`; **writes refused**). Credentials
   into the commands above.
 - **The bundled model is Apple Silicon only** (MLX). The RAG layer + agent run on Linux/Windows/WSL too —
   see [Running on Linux / Windows / WSL](#running-on-linux--windows--wsl).
-- **More agent detail** (every tool, the safety model, configuration env vars): see
-  [`agent/README.md`](agent/README.md). RAG details: [`rag/README.md`](rag/README.md).
+- **Model & provider config:** roles (planner/executor/coder/reviewer) and endpoints live in
+  `~/.magepilot/config.toml` — fully local by default; remote providers are opt-in per role and never
+  reachable implicitly. RAG details: [`rag/README.md`](rag/README.md).
 
 ## Privacy
 
