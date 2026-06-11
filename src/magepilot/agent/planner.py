@@ -132,6 +132,33 @@ def _tpl_debug(objective, m):
 
 
 def _tpl_create_tests(objective, m):
+    low = objective.lower()
+    if "playwright" in low or "e2e" in low:
+        return [
+            _t(1, "investigate", f"Identify the storefront target for: {objective}. Use "
+                                 f"`wiring` with aspect alpine (or the layout handle) to "
+                                 f"find the exact component/template and its page.",
+               done="component or handle + URL identified"),
+            _t(2, "edit", f"Create a Playwright spec under tests/playwright/ for: "
+                          f"{objective}. Target an Alpine component root with the "
+                          f"selector [x-data^=\"componentName(\"]; goto the page URL, "
+                          f"wait for domcontentloaded, assert visibility. (Tip: "
+                          f"`magepilot testgen --kind playwright <component>` generates "
+                          f"this deterministically.)",
+               done="spec created under tests/playwright/"),
+            _t(3, "command", "Run the Playwright tests", done="exit 0",
+               command="npx playwright test --config tests/playwright/playwright.config.js"),
+        ]
+    if "mftf" in low or "functional test" in low:
+        return [
+            _t(1, "investigate", f"Identify the storefront page under test for: "
+                                 f"{objective} (layout handle or Alpine component).",
+               done="handle/component identified"),
+            _t(2, "edit", f"Create the MFTF Page/Section/Test scaffold for: {objective}",
+               done="three MFTF XML files created"),
+            _t(3, "command", "Run the new MFTF test group", done="exit 0",
+               command="vendor/bin/mftf run:group"),
+        ]
     return [
         _t(1, "investigate", f"Identify the exact class under test for: {objective}. "
                              f"Use `symbol` to get its FQCN, file, methods, and constructor "

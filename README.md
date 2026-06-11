@@ -205,6 +205,9 @@ magepilot undo                        # revert the last make
 magepilot index                       # index the current project
 magepilot run "Which class throws NoSuchEntityException, and why?"
 magepilot review                      # advisory AI review of your uncommitted diff
+magepilot testgen 'Vendor\Faq\Model\FaqRepository'         # PHPUnit test (ctor mocks from the graph)
+magepilot testgen initFaqList --kind playwright             # Playwright spec from an Alpine component
+magepilot testgen faq_index_index --kind mftf               # MFTF Page/Section/Test scaffold
 magepilot suggest                     # commands for your uncommitted changes
 magepilot sql "SELECT entity_id, sku FROM catalog_product_entity LIMIT 20"
 ```

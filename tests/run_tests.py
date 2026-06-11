@@ -1817,6 +1817,112 @@ def _():
     shutil.rmtree(d, ignore_errors=True)
 
 
+# ================================================================== functional testgen
+import io as _io                                                       # noqa: E402
+
+import defusedxml.ElementTree as _DET                                  # noqa: E402
+
+from magepilot.testgen import common as tg_common                      # noqa: E402
+from magepilot.testgen import mftf as tg_mftf                          # noqa: E402
+from magepilot.testgen import playwright as tg_pw                      # noqa: E402
+
+
+@test("testgen common: targets resolve through the graph (alpine → template → handle → URL)")
+def _():
+    build_graph(ROOT, verbose=False)
+    t = tg_common.resolve_target(ROOT, "initFaqList")
+    assert_true(t.alpine == "initFaqList" and t.template == "Vendor_Faq::faq/list.phtml", str(t))
+    assert_true(t.handle == "faq_index_index" and t.url == "/faq/index/index", str(t))
+    assert_true(t.module == "Vendor_Faq", str(t))
+    t2 = tg_common.resolve_target(ROOT, "faq_index_index")
+    assert_true(t2.url == "/faq/index/index" and t2.module == "Vendor_Faq", str(t2))
+    t3 = tg_common.resolve_target(ROOT, "/checkout/cart")
+    assert_true(t3.url == "/checkout/cart" and not t3.module)
+    t4 = tg_common.resolve_target(ROOT, "somethingUnknown")
+    assert_in("AMONPAGE_URL", t4.url, "underivable URLs must be loudly placeholder'd")
+
+
+@test("MFTF skeleton: three parseable XMLs, graph selector, consistent wiring")
+def _():
+    ops, t = tg_mftf.skeleton(ROOT, "initFaqList")
+    assert_true(len(ops) == 3, str([o["path"] for o in ops]))
+    paths = {o["path"] for o in ops}
+    base = "app/code/Vendor/Faq/Test/Mftf"
+    assert_in(f"{base}/Test/StorefrontInitFaqListTest.xml", paths)
+    assert_in(f"{base}/Page/StorefrontInitFaqListPage.xml", paths)
+    assert_in(f"{base}/Section/StorefrontInitFaqListSection.xml", paths)
+    for o in ops:
+        _DET.parse(_io.StringIO(o["content"]))          # every file parses
+    section = next(o for o in ops if "/Section/" in o["path"])
+    assert_in("[x-data^='initFaqList(']", section["content"],
+              "the selector must be the exact graph-derived Alpine root")
+    page = next(o for o in ops if "/Page/" in o["path"])
+    assert_in('url="faq/index/index"', page["content"])
+    test_xml = next(o for o in ops if "/Mftf/Test/" in o["path"])
+    assert_in("StorefrontInitFaqListPage.url", test_xml["content"])
+    assert_in('group value="vendor_faq"', test_xml["content"])
+    assert_raises(ValueError, tg_mftf.skeleton, ROOT, "/just/a/url")
+
+
+@test("MFTF write: batch lands under the module, one journal, undo reverts all three")
+def _():
+    d = tempfile.mkdtemp(prefix="magepilot-mftfw-")
+    shutil.copytree(ROOT, os.path.join(d, "app", "code", "Vendor", "Faq"))
+    build_graph(d, verbose=False)
+    res = tg_mftf.write(d, "initFaqList", auto=True)
+    assert_true(len(res["written"]) == 3, str(res))
+    for rel in res["written"]:
+        assert_true(os.path.isfile(os.path.join(d, rel)), rel)
+    edits.undo(d)
+    for rel in res["written"]:
+        assert_true(not os.path.exists(os.path.join(d, rel)), f"undo must remove {rel}")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("Playwright skeleton: graph selector, node --check clean, config only when absent")
+def _():
+    ops, t = tg_pw.skeleton(ROOT, "initFaqList")
+    paths = [o["path"] for o in ops]
+    assert_in("tests/playwright/init_faq_list.spec.js", paths)
+    assert_in(tg_pw.CONFIG_REL, paths)
+    spec = next(o for o in ops if o["path"].endswith(".spec.js"))
+    assert_in("page.goto('/faq/index/index')", spec["content"])
+    assert_in('[x-data^="initFaqList("]', spec["content"])
+    assert_in("main#maincontent", spec["content"])
+    if shutil.which("node"):
+        assert_true(tg_pw._node_checks(spec["content"]))
+    d = tempfile.mkdtemp(prefix="magepilot-pww-")
+    res = tg_pw.write(d, "/checkout/cart", auto=True)
+    assert_true(len(res["written"]) == 2, str(res))
+    res2 = tg_pw.write(d, "/checkout/cart/index", auto=True)
+    assert_true(all("config" not in p for p in res2["written"]),
+                "config must not be recreated once present")
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@test("policy: mftf + npx playwright are ASK-tier; injection and unknown npx blocked")
+def _():
+    assert_true(actions.classify("vendor/bin/mftf run:group vendor_faq") == "ask")
+    assert_true(actions.classify("npx playwright test --config tests/playwright/playwright.config.js") == "ask")
+    assert_true(actions.classify("npx something-else") == "blocked")
+    assert_true(actions.classify("npx playwright test; rm -rf /") == "blocked")
+    r = actions.execute(ROOT, "vendor/bin/mftf run:group x", approver=lambda c, s: "yes")
+    assert_true(r["ran"] is False and "not found" in r["reason"], str(r))
+
+
+@test("planner: mftf and playwright objectives get their own templates")
+def _():
+    name, tasks = planner.plan("write a playwright e2e test for the FAQ list page")
+    assert_true(name == "create_tests")
+    assert_in("playwright", tasks[1].goal.lower())
+    assert_true(tasks[2].command.startswith("npx playwright test"), tasks[2].command)
+    name2, tasks2 = planner.plan("create an MFTF functional test for the FAQ page")
+    assert_in("MFTF", tasks2[1].goal)
+    assert_true(tasks2[2].command.startswith("vendor/bin/mftf"), tasks2[2].command)
+    name3, tasks3 = planner.plan("write unit tests for the FaqRepository class")
+    assert_true(tasks3[2].command.startswith("vendor/bin/phpunit"), "unit path unchanged")
+
+
 def main() -> int:
     passed = failed = 0
     print(f"running {len(_results)} deterministic tests (no model)\n")
