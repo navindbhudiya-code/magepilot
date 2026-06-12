@@ -2419,6 +2419,124 @@ def _():
         upd_check._git = orig_git
 
 
+def _mk_update_fixture():
+    """A fake 'origin' bare repo + an installer-style clone one release behind.
+
+    origin history: c1 (tag v0.1.0) … c2 touches src/magepilot/ + bumps pyproject (tag v0.2.0)
+    clone: checked out at v0.1.0 on main.  Returns (tmpdir, clone_path)."""
+    import subprocess as _sp
+    d = tempfile.mkdtemp(prefix="mp-upd-fix-")
+    src = os.path.join(d, "src_repo")
+    os.makedirs(os.path.join(src, "src", "magepilot"))
+
+    def g(cwd, *args):
+        _sp.run(["git", "-C", cwd, *args], capture_output=True, check=True,
+                env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    g(src, "init", "-q", "-b", "main")
+    with open(os.path.join(src, "pyproject.toml"), "w") as f:
+        f.write('version = "0.1.0"\n')
+    g(src, "add", "-A"); g(src, "commit", "-q", "-m", "c1"); g(src, "tag", "v0.1.0")
+    with open(os.path.join(src, "src", "magepilot", "x.py"), "w") as f:
+        f.write("X = 1\n")
+    with open(os.path.join(src, "pyproject.toml"), "w") as f:
+        f.write('version = "0.2.0"\n')
+    g(src, "add", "-A"); g(src, "commit", "-q", "-m", "c2"); g(src, "tag", "v0.2.0")
+    clone = os.path.join(d, "clone")
+    _sp.run(["git", "clone", "-q", src, clone], capture_output=True, check=True)
+    g(clone, "checkout", "-q", "main")
+    g(clone, "reset", "-q", "--hard", "v0.1.0")
+    return d, clone
+
+
+@test("updater rails: wrong branch and dirty tree refuse; untracked files pass")
+def _():
+    if not shutil.which("git"):
+        return
+    from magepilot.updater import apply as upd_apply
+    d, clone = _mk_update_fixture()
+    import subprocess as _sp
+    try:
+        assert_true(upd_apply.rails(clone) is None, "clean main clone must pass")
+        with open(os.path.join(clone, "config.toml"), "w") as f:
+            f.write("# untracked user config\n")
+        assert_true(upd_apply.rails(clone) is None,
+                    "untracked files (a real install has config.toml at the clone root) must pass")
+        _sp.run(["git", "-C", clone, "checkout", "-q", "-b", "feature/x"], check=True)
+        assert_in("main", upd_apply.rails(clone) or "")
+        _sp.run(["git", "-C", clone, "checkout", "-q", "main"], check=True)
+        with open(os.path.join(clone, "pyproject.toml"), "a") as f:
+            f.write("# local edit to a TRACKED file\n")
+        assert_in("clean", upd_apply.rails(clone) or "")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("updater lock: exclusive, stale locks reclaimed")
+def _():
+    from magepilot.updater import apply as upd_apply
+    if os.path.exists(config.UPDATE_LOCK_FILE):
+        os.unlink(config.UPDATE_LOCK_FILE)
+    assert_true(upd_apply.acquire_lock(), "first acquire wins")
+    assert_true(not upd_apply.acquire_lock(), "second acquire must fail while held")
+    upd_apply.release_lock()
+    assert_true(upd_apply.acquire_lock(), "released lock is reacquirable")
+    upd_apply.release_lock()
+    with open(config.UPDATE_LOCK_FILE, "w") as f:        # dead-PID + ancient lock
+        f.write("999999999")
+    old = time.time() - config.UPDATE_LOCK_STALE_S - 10
+    os.utime(config.UPDATE_LOCK_FILE, (old, old))
+    assert_true(upd_apply.acquire_lock(), "stale lock must be reclaimed")
+    upd_apply.release_lock()
+
+
+@test("updater apply: servers running → stage only; servers down → ff to the tag + state")
+def _():
+    if not shutil.which("git"):
+        return
+    from magepilot.updater import apply as upd_apply, check as upd_check, state as upd_state
+    d, clone = _mk_update_fixture()
+    orig_srv, orig_deps = upd_apply._servers_running, upd_apply._install_deps
+    deps_calls = []
+    upd_apply._install_deps = lambda root: (deps_calls.append(root) or (True, ""))
+    if os.path.exists(config.UPDATE_STATE_FILE):
+        os.unlink(config.UPDATE_STATE_FILE)
+    try:
+        upd_apply._servers_running = lambda: True
+        out = upd_apply.apply(clone, explicit=True, channel="stable")
+        assert_true(out["status"] == "staged", f"expected staged, got {out}")
+        assert_true(upd_state.read().get("staged_version") == "v0.2.0")
+        assert_true(upd_check.local_version(clone).startswith("v0.1.0"),
+                    "staged must not touch the tree")
+
+        upd_apply._servers_running = lambda: False
+        out = upd_apply.apply(clone, explicit=True, channel="stable")
+        assert_true(out["status"] == "applied", f"expected applied, got {out}")
+        assert_true(upd_check.local_version(clone) == "v0.2.0", "HEAD must land exactly on the tag")
+        assert_true(deps_calls, "pyproject.toml changed → deps reinstall must run")
+        st = upd_state.read()
+        assert_true(st.get("staged_version") == "" and st["last_result"]["ok"] is True)
+        assert_true(st["last_result"]["new"] == "v0.2.0" and st.get("notify") is False,
+                    "explicit update prints immediately — no launch notice")
+
+        out = upd_apply.apply(clone, explicit=True, channel="stable")
+        assert_true(out["status"] == "up-to-date")
+    finally:
+        upd_apply._servers_running, upd_apply._install_deps = orig_srv, orig_deps
+        shutil.rmtree(d, ignore_errors=True)
+        if os.path.exists(config.UPDATE_STATE_FILE):
+            os.unlink(config.UPDATE_STATE_FILE)
+
+
+@test("updater apply: background run refuses a non-installer-managed clone")
+def _():
+    from magepilot.updater import apply as upd_apply
+    out = upd_apply.apply("/definitely/not/the/install", explicit=False)
+    assert_true(out["status"] == "skipped")
+    assert_in("install", out["reason"])
+
+
 def main() -> int:
     passed = failed = 0
     print(f"running {len(_results)} deterministic tests (no model)\n")
