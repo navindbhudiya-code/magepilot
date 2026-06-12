@@ -2352,6 +2352,73 @@ def _():
     os.unlink(config.UPDATE_STATE_FILE)
 
 
+@test("updater check: semver parse handles v-prefix, describe suffix, garbage")
+def _():
+    from magepilot.updater import check as upd_check
+    assert_true(upd_check.parse_version("v0.2.0") == (0, 2, 0))
+    assert_true(upd_check.parse_version("0.10.1") == (0, 10, 1))
+    assert_true(upd_check.parse_version("v0.2.0-5-g158c5a0") == (0, 2, 0))
+    assert_true(upd_check.parse_version("v1.0") == (1, 0, 0))
+    assert_true(upd_check.parse_version("158c5a0") is None, "bare sha is not a version")
+    assert_true(upd_check.parse_version("") is None)
+    assert_true(upd_check.parse_version(None) is None)
+
+
+@test("updater check: v0.2.0 < v0.10.0 (semver, not string compare)")
+def _():
+    from magepilot.updater import check as upd_check
+    assert_true(upd_check.is_newer("v0.10.0", "v0.2.0"))
+    assert_true(not upd_check.is_newer("v0.2.0", "v0.10.0"))
+    assert_true(not upd_check.is_newer("v0.2.0", "v0.2.0"))
+    assert_true(not upd_check.is_newer("v0.2.0", "v0.2.0-5-g158c5a0"),
+                "commits past the tag are not older than the tag")
+    assert_true(not upd_check.is_newer("garbage", "v0.2.0"))
+    assert_true(not upd_check.is_newer("v0.3.0", "garbage"))
+
+
+@test("updater check: stable channel uses the GitHub release tag; offline is silent")
+def _():
+    from magepilot.updater import check as upd_check
+    orig_http, orig_git = upd_check._http_get, upd_check._git
+    upd_check._http_get = lambda url, timeout=3.0: (
+        b'{"tag_name": "v0.9.0", "html_url": "https://github.com/x/y/releases/tag/v0.9.0"}')
+    upd_check._git = lambda root, *a, **k: (0, "v0.2.0")        # local describe
+    try:
+        res = upd_check.check("/nonexistent", channel="stable")
+        assert_true(res["update_available"] is True)
+        assert_true(res["latest"] == "v0.9.0" and res["local"] == "v0.2.0")
+        assert_in("releases/tag/v0.9.0", res["url"])
+        upd_check._http_get = lambda url, timeout=3.0: None     # offline / rate-limited
+        res = upd_check.check("/nonexistent", channel="stable")
+        assert_true(res["update_available"] is False and res["latest"] is None,
+                    "any network failure must be silent, never raised")
+    finally:
+        upd_check._http_get, upd_check._git = orig_http, orig_git
+
+
+@test("updater check: edge channel compares HEAD to the remote main sha")
+def _():
+    from magepilot.updater import check as upd_check
+    orig_git = upd_check._git
+
+    def fake_git(root, *args, **kw):
+        if args[:1] == ("describe",):
+            return 0, "v0.2.0-3-gabc1234"
+        if args[:1] == ("ls-remote",):
+            return 0, "feedfacefeedfacefeedfacefeedfacefeedface\trefs/heads/main"
+        if args[:1] == ("rev-parse",):
+            return 0, "abc1234abc1234abc1234abc1234abc1234abc12"
+        return 1, ""
+
+    upd_check._git = fake_git
+    try:
+        res = upd_check.check("/nonexistent", channel="edge")
+        assert_true(res["update_available"] is True)
+        assert_true(res["latest"].startswith("feedface"))
+    finally:
+        upd_check._git = orig_git
+
+
 def main() -> int:
     passed = failed = 0
     print(f"running {len(_results)} deterministic tests (no model)\n")
