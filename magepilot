@@ -159,6 +159,13 @@ cmd_status() {
   up "$RAG_PORT"   && ok "RAG proxy     :$RAG_PORT  UP"   || warn "RAG proxy     :$RAG_PORT  down"
 }
 
+cmd_version() {
+  local v
+  v="$(git -C "$ROOT" describe --tags --always 2>/dev/null || true)"
+  [ -n "$v" ] || v="v$(grep -m1 '^version' "$ROOT/pyproject.toml" | cut -d'"' -f2)"
+  echo "magepilot ${v:-unknown}"
+}
+
 # ----------------------------------------------------------------------------- use
 cmd_ask()     { activate; python "$ROOT/rag/ask.py" "$@"; }
 cmd_agent()   { activate; cd "$ROOT"; python -m magepilot "$@"; }   # index|run|suggest|watch|sql
@@ -175,6 +182,7 @@ ${c_green}Setup${c_off}
   ./magepilot serve                start the model server (:$MODEL_PORT) + RAG proxy (:$RAG_PORT)
   ./magepilot stop                 stop both servers
   ./magepilot status               show what's running
+  ./magepilot update               update Magepilot now (--check = just look)
 
 ${c_green}Use${c_off}
   ./magepilot ask "<question>"            ask the grounded assistant
@@ -194,6 +202,7 @@ ${c_green}Use${c_off}
   (index/run/suggest/watch/sql forward straight to the agent CLI — all its flags work.)
 
 ${c_green}Tips${c_off}
+  • Magepilot auto-updates in the background; disable with MAGEPILOT_NO_AUTO_UPDATE=1
   • Override the model:  MAGEPILOT_MODEL=<hf-id-or-path> ./magepilot serve
   • Non-Apple hosts: set MODEL_SERVER to your own OpenAI-compatible server (see README).
   • Put it on PATH:  ln -s "$ROOT/magepilot" /usr/local/bin/magepilot   (then just: magepilot …)
@@ -209,8 +218,9 @@ case "$cmd" in
   stop)               cmd_stop "$@" ;;
   status)             cmd_status "$@" ;;
   ask)                cmd_ask "$@" ;;
-  index|run|suggest|watch|sql|make|undo|do|resume|runs|graph|review|testgen) cmd_agent "$cmd" "$@" ;;
+  index|run|suggest|watch|sql|make|undo|do|resume|runs|graph|review|testgen|update) cmd_agent "$cmd" "$@" ;;
   mcp-serve)          activate 1>&2; cd "$ROOT"; exec python -m magepilot mcp-serve "$@" ;;
+  --version|-V|version) cmd_version ;;
   help|-h|--help)     usage ;;
   *)                  warn "unknown command: $cmd"; echo; usage; exit 1 ;;
 esac

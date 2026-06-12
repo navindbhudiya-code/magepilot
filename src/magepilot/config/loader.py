@@ -10,7 +10,7 @@ import os
 import tomllib
 
 import magepilot.config.defaults as defaults
-from magepilot.config.schema import Config, LimitsCfg, McpServerCfg, ProviderCfg
+from magepilot.config.schema import Config, LimitsCfg, McpServerCfg, ProviderCfg, UpdaterCfg
 
 USER_CONFIG = os.path.expanduser("~/.magepilot/config.toml")
 PROJECT_CONFIG_NAME = ".magepilot.toml"
@@ -37,11 +37,11 @@ def _read_toml(path: str) -> dict:
 
 def load(project_root: str | None = None) -> Config:
     """Build the effective Config for a session."""
+    user_data = _read_toml(USER_CONFIG)
     data: dict = {}
-    for path in (USER_CONFIG,
-                 os.path.join(project_root, PROJECT_CONFIG_NAME) if project_root else None):
-        if path:
-            _merge(data, _read_toml(path))
+    _merge(data, user_data)
+    if project_root:
+        _merge(data, _read_toml(os.path.join(project_root, PROJECT_CONFIG_NAME)))
 
     providers = {"local": ProviderCfg(name="local", base_url=defaults.MODEL_SERVER)}
     for name, p in (data.get("providers") or {}).items():
@@ -63,6 +63,13 @@ def load(project_root: str | None = None) -> Config:
         wall_clock_minutes=int(lim.get("wall_clock_minutes", LimitsCfg.wall_clock_minutes)),
     )
 
+    # [updater] comes from the USER layer only — see UpdaterCfg docstring.
+    upd = user_data.get("updater") or {}
+    updater = UpdaterCfg(
+        auto_update=bool(upd.get("auto_update", True)),
+        channel=str(upd.get("channel", "stable")),
+    )
+
     mcp_servers = {}
     for name, m in (data.get("mcp_servers") or {}).items():
         if m.get("command"):
@@ -77,6 +84,7 @@ def load(project_root: str | None = None) -> Config:
         sampling={**defaults.SAMPLING, **(data.get("sampling") or {})},
         strict_models=bool(data.get("strict_models", False)),
         mcp_servers=mcp_servers,
+        updater=updater,
     )
 
     # Env wins over files (v1 back-compat).
@@ -84,6 +92,8 @@ def load(project_root: str | None = None) -> Config:
         cfg.providers["local"] = ProviderCfg(name="local", base_url=os.environ["MODEL_SERVER"])
     if os.environ.get("AGENT_MODEL"):
         cfg.roles["executor"] = "local:" + os.environ["AGENT_MODEL"]
+    if os.environ.get("MAGEPILOT_NO_AUTO_UPDATE") == "1":
+        cfg.updater = UpdaterCfg(auto_update=False, channel=cfg.updater.channel)
     return cfg
 
 

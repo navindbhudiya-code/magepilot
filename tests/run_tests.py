@@ -9,6 +9,7 @@ and (new in v2) the tool registry/permission gate, the config loader, and the mo
 import os
 import shutil
 import tempfile
+import time
 import traceback
 
 from magepilot import config
@@ -19,6 +20,9 @@ config.CODE_CHROMA_PATH = os.path.join(_TMP, "code_index")
 config.ROOT_MARKER = os.path.join(config.CODE_CHROMA_PATH, "root.txt")
 config.UNDO_FILE = os.path.join(_TMP, "last_make.json")
 config.RUNS_DIR = os.path.join(_TMP, "runs")
+config.UPDATE_STATE_FILE = os.path.join(_TMP, "update_state.json")
+config.UPDATE_LOCK_FILE = os.path.join(_TMP, "update.lock")
+config.UPDATE_LOG_FILE = os.path.join(_TMP, "update.log")
 
 from magepilot import edits, tools                                    # noqa: E402
 from magepilot.agent import compress, loop, planner                   # noqa: E402
@@ -2299,6 +2303,364 @@ def _():
     assert_true(res["applied"] == [])
     assert_true(not os.path.exists(os.path.join(d, "app/code")), "plan-only must write nothing")
     shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ updater
+@test("config: [updater] defaults on and stable; project layer cannot override it")
+def _():
+    import tempfile as _tf
+    d = _tf.mkdtemp(prefix="mp-upd-cfg-")
+    try:
+        with open(os.path.join(d, ".magepilot.toml"), "w") as f:
+            f.write('[updater]\nauto_update = false\nchannel = "edge"\n')
+        cfg = config_loader.load(d)        # project layer tries to flip it
+        assert_true(cfg.updater.auto_update is True,
+                    "project .magepilot.toml must not control the updater")
+        assert_true(cfg.updater.channel == "stable")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("config: MAGEPILOT_NO_AUTO_UPDATE=1 forces auto_update off")
+def _():
+    os.environ["MAGEPILOT_NO_AUTO_UPDATE"] = "1"
+    try:
+        assert_true(config_loader.load().updater.auto_update is False)
+    finally:
+        del os.environ["MAGEPILOT_NO_AUTO_UPDATE"]
+
+
+@test("updater state: round-trip, missing file, corrupt file all safe")
+def _():
+    from magepilot.updater import state as upd_state
+    if os.path.exists(config.UPDATE_STATE_FILE):
+        os.unlink(config.UPDATE_STATE_FILE)
+    assert_true(upd_state.read() == {}, "missing file reads as {}")
+    upd_state.write({"last_check_ts": 1.0, "staged_version": "v9.9.9"})
+    assert_true(upd_state.read()["staged_version"] == "v9.9.9")
+    merged = upd_state.update(notify=True)
+    assert_true(merged["last_check_ts"] == 1.0 and merged["notify"] is True,
+                "update() merges, never clobbers")
+    with open(config.UPDATE_STATE_FILE, "w") as f:
+        f.write("{not json!!")
+    assert_true(upd_state.read() == {}, "corrupt file reads as {}")
+    upd_state.update(last_check_ts=2.0)           # update over corrupt → fresh dict
+    assert_true(upd_state.read()["last_check_ts"] == 2.0)
+    with open(config.UPDATE_STATE_FILE, "w") as f:
+        f.write('["a", "list"]')
+    assert_true(upd_state.read() == {}, "non-dict JSON reads as {}")
+    os.unlink(config.UPDATE_STATE_FILE)
+
+
+@test("updater check: semver parse handles v-prefix, describe suffix, garbage")
+def _():
+    from magepilot.updater import check as upd_check
+    assert_true(upd_check.parse_version("v0.2.0") == (0, 2, 0))
+    assert_true(upd_check.parse_version("0.10.1") == (0, 10, 1))
+    assert_true(upd_check.parse_version("v0.2.0-5-g158c5a0") == (0, 2, 0))
+    assert_true(upd_check.parse_version("v1.0") == (1, 0, 0))
+    assert_true(upd_check.parse_version("158c5a0") is None, "bare sha is not a version")
+    assert_true(upd_check.parse_version("") is None)
+    assert_true(upd_check.parse_version(None) is None)
+
+
+@test("updater check: v0.2.0 < v0.10.0 (semver, not string compare)")
+def _():
+    from magepilot.updater import check as upd_check
+    assert_true(upd_check.is_newer("v0.10.0", "v0.2.0"))
+    assert_true(not upd_check.is_newer("v0.2.0", "v0.10.0"))
+    assert_true(not upd_check.is_newer("v0.2.0", "v0.2.0"))
+    assert_true(not upd_check.is_newer("v0.2.0", "v0.2.0-5-g158c5a0"),
+                "commits past the tag are not older than the tag")
+    assert_true(not upd_check.is_newer("garbage", "v0.2.0"))
+    assert_true(not upd_check.is_newer("v0.3.0", "garbage"))
+
+
+@test("updater check: stable uses the release API, falls back to remote tags, offline silent")
+def _():
+    from magepilot.updater import check as upd_check
+    orig_http, orig_git = upd_check._http_get, upd_check._git
+
+    def fake_git(root, *a, **k):
+        if a[:1] == ("describe",):
+            return 0, "v0.2.0"
+        if a[:2] == ("ls-remote", "--tags"):
+            return 0, ("aaa\trefs/tags/v0.3.0\n"
+                       "bbb\trefs/tags/v0.10.0\n"
+                       "ccc\trefs/tags/not-a-version")
+        return 1, ""
+
+    upd_check._http_get = lambda url, timeout=3.0: (
+        b'{"tag_name": "v0.9.0", "html_url": "https://github.com/x/y/releases/tag/v0.9.0"}')
+    upd_check._git = fake_git
+    try:
+        res = upd_check.check("/nonexistent", channel="stable")
+        assert_true(res["update_available"] is True)
+        assert_true(res["latest"] == "v0.9.0" and res["local"] == "v0.2.0")
+        assert_in("releases/tag/v0.9.0", res["url"])
+
+        upd_check._http_get = lambda url, timeout=3.0: None     # API 404 / rate-limited
+        res = upd_check.check("/nonexistent", channel="stable")
+        assert_true(res["latest"] == "v0.10.0",
+                    "no Release objects → newest remote TAG, in semver (not string) order")
+        assert_true(res["update_available"] is True)
+
+        upd_check._git = lambda root, *a, **k: ((0, "v0.2.0") if a[:1] == ("describe",)
+                                                else (1, ""))   # fully offline
+        res = upd_check.check("/nonexistent", channel="stable")
+        assert_true(res["update_available"] is False and res["latest"] is None,
+                    "any network failure must be silent, never raised")
+    finally:
+        upd_check._http_get, upd_check._git = orig_http, orig_git
+
+
+@test("updater check: edge channel compares HEAD to the remote main sha")
+def _():
+    from magepilot.updater import check as upd_check
+    orig_git = upd_check._git
+
+    def fake_git(root, *args, **kw):
+        if args[:1] == ("describe",):
+            return 0, "v0.2.0-3-gabc1234"
+        if args[:1] == ("ls-remote",):
+            return 0, "feedfacefeedfacefeedfacefeedfacefeedface\trefs/heads/main"
+        if args[:1] == ("rev-parse",):
+            return 0, "abc1234abc1234abc1234abc1234abc1234abc12"
+        return 1, ""
+
+    upd_check._git = fake_git
+    try:
+        res = upd_check.check("/nonexistent", channel="edge")
+        assert_true(res["update_available"] is True)
+        assert_true(res["latest"].startswith("feedface"))
+    finally:
+        upd_check._git = orig_git
+
+
+def _mk_update_fixture():
+    """A fake 'origin' bare repo + an installer-style clone one release behind.
+
+    origin history: c1 (tag v0.1.0) … c2 touches src/magepilot/ + bumps pyproject (tag v0.2.0)
+    clone: checked out at v0.1.0 on main.  Returns (tmpdir, clone_path)."""
+    import subprocess as _sp
+    d = tempfile.mkdtemp(prefix="mp-upd-fix-")
+    src = os.path.join(d, "src_repo")
+    os.makedirs(os.path.join(src, "src", "magepilot"))
+
+    def g(cwd, *args):
+        _sp.run(["git", "-C", cwd, *args], capture_output=True, check=True,
+                env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    g(src, "init", "-q", "-b", "main")
+    with open(os.path.join(src, "pyproject.toml"), "w") as f:
+        f.write('version = "0.1.0"\n')
+    g(src, "add", "-A"); g(src, "commit", "-q", "-m", "c1"); g(src, "tag", "v0.1.0")
+    with open(os.path.join(src, "src", "magepilot", "x.py"), "w") as f:
+        f.write("X = 1\n")
+    with open(os.path.join(src, "pyproject.toml"), "w") as f:
+        f.write('version = "0.2.0"\n')
+    g(src, "add", "-A"); g(src, "commit", "-q", "-m", "c2"); g(src, "tag", "v0.2.0")
+    clone = os.path.join(d, "clone")
+    _sp.run(["git", "clone", "-q", src, clone], capture_output=True, check=True)
+    g(clone, "checkout", "-q", "main")
+    g(clone, "reset", "-q", "--hard", "v0.1.0")
+    return d, clone
+
+
+@test("updater rails: wrong branch and dirty tree refuse; untracked files pass")
+def _():
+    if not shutil.which("git"):
+        return
+    from magepilot.updater import apply as upd_apply
+    d, clone = _mk_update_fixture()
+    import subprocess as _sp
+    try:
+        assert_true(upd_apply.rails(clone) is None, "clean main clone must pass")
+        with open(os.path.join(clone, "config.toml"), "w") as f:
+            f.write("# untracked user config\n")
+        assert_true(upd_apply.rails(clone) is None,
+                    "untracked files (a real install has config.toml at the clone root) must pass")
+        _sp.run(["git", "-C", clone, "checkout", "-q", "-b", "feature/x"], check=True)
+        assert_in("main", upd_apply.rails(clone) or "")
+        _sp.run(["git", "-C", clone, "checkout", "-q", "main"], check=True)
+        with open(os.path.join(clone, "pyproject.toml"), "a") as f:
+            f.write("# local edit to a TRACKED file\n")
+        assert_in("clean", upd_apply.rails(clone) or "")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("updater lock: exclusive, stale locks reclaimed")
+def _():
+    from magepilot.updater import apply as upd_apply
+    if os.path.exists(config.UPDATE_LOCK_FILE):
+        os.unlink(config.UPDATE_LOCK_FILE)
+    assert_true(upd_apply.acquire_lock(), "first acquire wins")
+    assert_true(not upd_apply.acquire_lock(), "second acquire must fail while held")
+    upd_apply.release_lock()
+    assert_true(upd_apply.acquire_lock(), "released lock is reacquirable")
+    upd_apply.release_lock()
+    with open(config.UPDATE_LOCK_FILE, "w") as f:        # dead-PID + ancient lock
+        f.write("999999999")
+    old = time.time() - config.UPDATE_LOCK_STALE_S - 10
+    os.utime(config.UPDATE_LOCK_FILE, (old, old))
+    assert_true(upd_apply.acquire_lock(), "stale lock must be reclaimed")
+    upd_apply.release_lock()
+
+
+@test("updater apply: servers running → stage only; servers down → ff to the tag + state")
+def _():
+    if not shutil.which("git"):
+        return
+    from magepilot.updater import apply as upd_apply, check as upd_check, state as upd_state
+    d, clone = _mk_update_fixture()
+    orig_srv, orig_deps = upd_apply._servers_running, upd_apply._install_deps
+    deps_calls = []
+    upd_apply._install_deps = lambda root: (deps_calls.append(root) or (True, ""))
+    if os.path.exists(config.UPDATE_STATE_FILE):
+        os.unlink(config.UPDATE_STATE_FILE)
+    try:
+        upd_apply._servers_running = lambda: True
+        out = upd_apply.apply(clone, explicit=True, channel="stable")
+        assert_true(out["status"] == "staged", f"expected staged, got {out}")
+        assert_true(upd_state.read().get("staged_version") == "v0.2.0")
+        assert_true(upd_check.local_version(clone).startswith("v0.1.0"),
+                    "staged must not touch the tree")
+
+        upd_apply._servers_running = lambda: False
+        out = upd_apply.apply(clone, explicit=True, channel="stable")
+        assert_true(out["status"] == "applied", f"expected applied, got {out}")
+        assert_true(upd_check.local_version(clone) == "v0.2.0", "HEAD must land exactly on the tag")
+        assert_true(deps_calls, "pyproject.toml changed → deps reinstall must run")
+        st = upd_state.read()
+        assert_true(st.get("staged_version") == "" and st["last_result"]["ok"] is True)
+        assert_true(st["last_result"]["new"] == "v0.2.0" and st.get("notify") is False,
+                    "explicit update prints immediately — no launch notice")
+
+        out = upd_apply.apply(clone, explicit=True, channel="stable")
+        assert_true(out["status"] == "up-to-date")
+    finally:
+        upd_apply._servers_running, upd_apply._install_deps = orig_srv, orig_deps
+        shutil.rmtree(d, ignore_errors=True)
+        if os.path.exists(config.UPDATE_STATE_FILE):
+            os.unlink(config.UPDATE_STATE_FILE)
+
+
+@test("updater apply: background run refuses a non-installer-managed clone")
+def _():
+    from magepilot.updater import apply as upd_apply
+    out = upd_apply.apply("/definitely/not/the/install", explicit=False)
+    assert_true(out["status"] == "skipped")
+    assert_in("install", out["reason"])
+
+
+def _hook_sandbox():
+    """(updater, spawned, emitted, restore) — every hook seam stubbed + clean state."""
+    from magepilot import updater as upd
+    spawned, emitted = [], []
+    orig = (upd._spawn, upd._emit, upd._auto_update_enabled, upd._is_managed_install)
+    upd._spawn = lambda cmd, log: spawned.append(cmd)
+    upd._emit = lambda msg: emitted.append(msg)
+    upd._auto_update_enabled = lambda: True
+    upd._is_managed_install = lambda root: True
+    if os.path.exists(config.UPDATE_STATE_FILE):
+        os.unlink(config.UPDATE_STATE_FILE)
+
+    def restore():
+        upd._spawn, upd._emit, upd._auto_update_enabled, upd._is_managed_install = orig
+        if os.path.exists(config.UPDATE_STATE_FILE):
+            os.unlink(config.UPDATE_STATE_FILE)
+    return upd, spawned, emitted, restore
+
+
+@test("updater hook: due check spawns detached updater and claims the throttle first")
+def _():
+    from magepilot.updater import state as upd_state
+    upd, spawned, emitted, restore = _hook_sandbox()
+    try:
+        upd_state.write({"last_check_ts": 0})
+        upd.launch_hook(["runs"])
+        assert_true(len(spawned) == 1 and spawned[0][-2:] == ["-m", "magepilot.updater"])
+        assert_true(upd_state.read()["last_check_ts"] > 0, "throttle claimed before spawn")
+        upd.launch_hook(["runs"])
+        assert_true(len(spawned) == 1, "fresh stamp must throttle the second launch")
+    finally:
+        restore()
+
+
+@test("updater hook: throttle logic — 24h window, future clock skew, staged bypass")
+def _():
+    from magepilot import updater as upd
+    now = 1_000_000.0
+    day = config.UPDATE_CHECK_INTERVAL_S
+    assert_true(upd._should_check({}, now), "no state → check")
+    assert_true(upd._should_check({"last_check_ts": now - day - 1}, now))
+    assert_true(not upd._should_check({"last_check_ts": now - 60}, now))
+    assert_true(upd._should_check({"last_check_ts": now + day * 9}, now),
+                "a future timestamp (clock skew) must not block checks forever")
+    assert_true(upd._should_check({"last_check_ts": now - 60, "staged_version": "v9"}, now),
+                "a staged update bypasses the 24h throttle")
+    assert_true(upd._should_check({"last_check_ts": "corrupt"}, now))
+
+
+@test("updater hook: MAGEPILOT_NO_AUTO_UPDATE / auto_update off / mcp-serve → no spawn")
+def _():
+    upd, spawned, emitted, restore = _hook_sandbox()
+    try:
+        os.environ["MAGEPILOT_NO_AUTO_UPDATE"] = "1"
+        upd.launch_hook(["runs"])
+        del os.environ["MAGEPILOT_NO_AUTO_UPDATE"]
+        assert_true(not spawned, "env kill-switch must disable everything")
+
+        upd._auto_update_enabled = lambda: False
+        upd.launch_hook(["runs"])
+        assert_true(not spawned, "auto_update=false must not spawn")
+        upd._auto_update_enabled = lambda: True
+
+        upd.launch_hook(["mcp-serve"])
+        assert_true(not spawned and not emitted, "mcp-serve is stdio JSON-RPC — total silence")
+
+        upd._is_managed_install = lambda root: False
+        upd.launch_hook(["runs"])
+        assert_true(not spawned, "dev checkouts never auto-update")
+    finally:
+        restore()
+
+
+@test("updater hook: applied-update notice prints once, then clears")
+def _():
+    from magepilot.updater import state as upd_state
+    upd, spawned, emitted, restore = _hook_sandbox()
+    try:
+        upd_state.write({"notify": True, "last_check_ts": time.time(),
+                         "last_result": {"ok": True, "new": "v0.3.0",
+                                         "url": "https://github.com/x/releases/tag/v0.3.0"}})
+        upd.launch_hook(["runs"])
+        assert_true(len(emitted) == 1)
+        assert_in("v0.3.0", emitted[0])
+        assert_in("releases/tag/v0.3.0", emitted[0])
+        upd.launch_hook(["runs"])
+        assert_true(len(emitted) == 1, "the notice prints exactly once")
+    finally:
+        restore()
+
+
+@test("updater hook: adds <50ms to launch")
+def _():
+    from magepilot.updater import state as upd_state
+    upd, spawned, emitted, restore = _hook_sandbox()
+    try:
+        upd_state.write({"last_check_ts": time.time()})    # steady state: nothing to do
+        samples = []
+        for _i in range(5):
+            t0 = time.perf_counter()
+            upd.launch_hook(["runs"])
+            samples.append(time.perf_counter() - t0)
+        samples.sort()
+        assert_true(samples[2] < 0.050, f"hook median {samples[2]*1000:.1f}ms ≥ 50ms")
+    finally:
+        restore()
 
 
 def main() -> int:

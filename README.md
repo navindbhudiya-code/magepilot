@@ -42,7 +42,10 @@ environment + Magento knowledge base, and adds the `magepilot` command to your P
 > script before you run anything. Override the location with
 > `MAGEPILOT_HOME=/path curl -fsSL https://navindbhudiya.com/install.sh | bash`.
 
-Re-running the one-liner later updates an existing install (`git pull`).
+Magepilot keeps itself up to date: every command quietly checks for a new release in the
+background and applies it on the next launch (you'll see a one-line notice). Update on
+demand with `magepilot update` (`--check` to just look). Re-running the install one-liner
+remains the manual fallback.
 
 ### Manual install
 
@@ -264,6 +267,10 @@ Read-only only (`SELECT` / `SHOW` / `DESCRIBE`; **writes refused**). Credentials
 
 - **Always keep the server running** before using `ask`, the agent, or PhpStorm.
 - **Use `uv pip install`**, not `pip` (this environment has no `pip`).
+- **Auto-update**: silent + staged, applied on the next launch — never mid-session, and never
+  while the servers are running. Opt out with `MAGEPILOT_NO_AUTO_UPDATE=1` or
+  `[updater] auto_update = false` in `~/.magepilot/config.toml` (`channel = "edge"` tracks
+  the tip of main instead of release tags).
 - **Answers loop / repeat?** Make sure you're sampling (`--temp 0.3`), not greedy decoding — it's baked
   into the commands above.
 - **The bundled model is Apple Silicon only** (MLX). The RAG layer + agent run on Linux/Windows/WSL too —

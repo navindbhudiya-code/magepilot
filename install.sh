@@ -112,5 +112,8 @@ echo "    1. ${B}open a new terminal${X}   so the 'magepilot' command is on your
 echo "    2. ${B}magepilot serve${X}       first run downloads the model (~4 GB) → logs/model.log"
 echo "    3. ${B}cd${X} into any Magento project and run ${B}magepilot${X}"
 echo
+echo "  ${D}Magepilot keeps itself up to date automatically — 'magepilot update' anytime,${X}"
+echo "  ${D}or re-run this installer as a manual fallback.${X}"
+echo
 echo "  ${D}docs & help:  https://github.com/navindbhudiya-code/magepilot${X}"
 echo
