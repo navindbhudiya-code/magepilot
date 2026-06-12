@@ -79,6 +79,17 @@ MANIFEST_RETRIES = 2            # coder re-prompts per missing manifest file
 REPAIR_ROUNDS = 2               # validate→repair loop rounds after plan assembly
 PHP_LINT_TIMEOUT = 20           # seconds for `php -l` (validation skips when php is absent)
 
+# --- Auto-update (updater/): silent background check + staged apply, Claude-Code style ---
+UPDATE_REPO_SLUG = "navindbhudiya-code/magepilot"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO_SLUG}/releases/latest"
+UPDATE_CHECK_INTERVAL_S = 24 * 3600     # background check at most once a day
+UPDATE_LOCK_STALE_S = 600               # a lock older than this is from a dead updater
+# State/lock/log live with the INSTALL (REPO_ROOT == ~/.magepilot for installer-managed
+# clones), matching the wrapper's RUNDIR/LOGDIR pattern — never in the user's project.
+UPDATE_STATE_FILE = os.path.join(REPO_ROOT, ".magepilot", "update_state.json")
+UPDATE_LOCK_FILE = os.path.join(REPO_ROOT, ".magepilot", "update.lock")
+UPDATE_LOG_FILE = os.path.join(REPO_ROOT, "logs", "update.log")
+
 # --- Safety: the ONLY bin/magento subcommands the agent may run (read-only) ---
 MAGENTO_CLI_WHITELIST = (
     "module:status",

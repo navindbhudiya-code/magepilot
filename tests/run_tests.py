@@ -9,6 +9,7 @@ and (new in v2) the tool registry/permission gate, the config loader, and the mo
 import os
 import shutil
 import tempfile
+import time
 import traceback
 
 from magepilot import config
@@ -19,6 +20,9 @@ config.CODE_CHROMA_PATH = os.path.join(_TMP, "code_index")
 config.ROOT_MARKER = os.path.join(config.CODE_CHROMA_PATH, "root.txt")
 config.UNDO_FILE = os.path.join(_TMP, "last_make.json")
 config.RUNS_DIR = os.path.join(_TMP, "runs")
+config.UPDATE_STATE_FILE = os.path.join(_TMP, "update_state.json")
+config.UPDATE_LOCK_FILE = os.path.join(_TMP, "update.lock")
+config.UPDATE_LOG_FILE = os.path.join(_TMP, "update.log")
 
 from magepilot import edits, tools                                    # noqa: E402
 from magepilot.agent import compress, loop, planner                   # noqa: E402
@@ -2299,6 +2303,31 @@ def _():
     assert_true(res["applied"] == [])
     assert_true(not os.path.exists(os.path.join(d, "app/code")), "plan-only must write nothing")
     shutil.rmtree(d, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ updater
+@test("config: [updater] defaults on and stable; project layer cannot override it")
+def _():
+    import tempfile as _tf
+    d = _tf.mkdtemp(prefix="mp-upd-cfg-")
+    try:
+        with open(os.path.join(d, ".magepilot.toml"), "w") as f:
+            f.write('[updater]\nauto_update = false\nchannel = "edge"\n')
+        cfg = config_loader.load(d)        # project layer tries to flip it
+        assert_true(cfg.updater.auto_update is True,
+                    "project .magepilot.toml must not control the updater")
+        assert_true(cfg.updater.channel == "stable")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("config: MAGEPILOT_NO_AUTO_UPDATE=1 forces auto_update off")
+def _():
+    os.environ["MAGEPILOT_NO_AUTO_UPDATE"] = "1"
+    try:
+        assert_true(config_loader.load().updater.auto_update is False)
+    finally:
+        del os.environ["MAGEPILOT_NO_AUTO_UPDATE"]
 
 
 def main() -> int:

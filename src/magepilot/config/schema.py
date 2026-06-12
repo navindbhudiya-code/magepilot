@@ -39,6 +39,14 @@ class LimitsCfg:
     wall_clock_minutes: int = 20
 
 
+@dataclass(frozen=True)
+class UpdaterCfg:
+    """[updater] — read from the USER config layer only (a project's .magepilot.toml
+    must never be able to flip auto-update for the whole install)."""
+    auto_update: bool = True
+    channel: str = "stable"     # stable = release tags only | edge = tip of main
+
+
 @dataclass
 class Config:
     providers: dict[str, ProviderCfg] = field(default_factory=dict)
@@ -48,3 +56,4 @@ class Config:
     sampling: dict = field(default_factory=dict)
     strict_models: bool = False            # fail instead of substituting the loaded model
     mcp_servers: dict[str, McpServerCfg] = field(default_factory=dict)
+    updater: UpdaterCfg = field(default_factory=UpdaterCfg)
