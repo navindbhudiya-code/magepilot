@@ -213,6 +213,8 @@ magepilot testgen initFaqList --kind playwright             # Playwright spec fr
 magepilot testgen faq_index_index --kind mftf               # MFTF Page/Section/Test scaffold
 magepilot suggest                     # commands for your uncommitted changes
 magepilot sql "SELECT entity_id, sku FROM catalog_product_entity LIMIT 20"
+magepilot update                      # update Magepilot now (--check = dry run) — it also self-updates daily
+magepilot --version                   # print the installed version
 ```
 
 > **Run `magepilot` from anywhere** — put it on your PATH once (from the repo):
