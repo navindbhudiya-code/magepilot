@@ -2330,6 +2330,28 @@ def _():
         del os.environ["MAGEPILOT_NO_AUTO_UPDATE"]
 
 
+@test("updater state: round-trip, missing file, corrupt file all safe")
+def _():
+    from magepilot.updater import state as upd_state
+    if os.path.exists(config.UPDATE_STATE_FILE):
+        os.unlink(config.UPDATE_STATE_FILE)
+    assert_true(upd_state.read() == {}, "missing file reads as {}")
+    upd_state.write({"last_check_ts": 1.0, "staged_version": "v9.9.9"})
+    assert_true(upd_state.read()["staged_version"] == "v9.9.9")
+    merged = upd_state.update(notify=True)
+    assert_true(merged["last_check_ts"] == 1.0 and merged["notify"] is True,
+                "update() merges, never clobbers")
+    with open(config.UPDATE_STATE_FILE, "w") as f:
+        f.write("{not json!!")
+    assert_true(upd_state.read() == {}, "corrupt file reads as {}")
+    upd_state.update(last_check_ts=2.0)           # update over corrupt → fresh dict
+    assert_true(upd_state.read()["last_check_ts"] == 2.0)
+    with open(config.UPDATE_STATE_FILE, "w") as f:
+        f.write('["a", "list"]')
+    assert_true(upd_state.read() == {}, "non-dict JSON reads as {}")
+    os.unlink(config.UPDATE_STATE_FILE)
+
+
 def main() -> int:
     passed = failed = 0
     print(f"running {len(_results)} deterministic tests (no model)\n")
