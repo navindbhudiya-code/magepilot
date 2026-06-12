@@ -2537,6 +2537,114 @@ def _():
     assert_in("install", out["reason"])
 
 
+def _hook_sandbox():
+    """(updater, spawned, emitted, restore) — every hook seam stubbed + clean state."""
+    from magepilot import updater as upd
+    spawned, emitted = [], []
+    orig = (upd._spawn, upd._emit, upd._auto_update_enabled, upd._is_managed_install)
+    upd._spawn = lambda cmd, log: spawned.append(cmd)
+    upd._emit = lambda msg: emitted.append(msg)
+    upd._auto_update_enabled = lambda: True
+    upd._is_managed_install = lambda root: True
+    if os.path.exists(config.UPDATE_STATE_FILE):
+        os.unlink(config.UPDATE_STATE_FILE)
+
+    def restore():
+        upd._spawn, upd._emit, upd._auto_update_enabled, upd._is_managed_install = orig
+        if os.path.exists(config.UPDATE_STATE_FILE):
+            os.unlink(config.UPDATE_STATE_FILE)
+    return upd, spawned, emitted, restore
+
+
+@test("updater hook: due check spawns detached updater and claims the throttle first")
+def _():
+    from magepilot.updater import state as upd_state
+    upd, spawned, emitted, restore = _hook_sandbox()
+    try:
+        upd_state.write({"last_check_ts": 0})
+        upd.launch_hook(["runs"])
+        assert_true(len(spawned) == 1 and spawned[0][-2:] == ["-m", "magepilot.updater"])
+        assert_true(upd_state.read()["last_check_ts"] > 0, "throttle claimed before spawn")
+        upd.launch_hook(["runs"])
+        assert_true(len(spawned) == 1, "fresh stamp must throttle the second launch")
+    finally:
+        restore()
+
+
+@test("updater hook: throttle logic — 24h window, future clock skew, staged bypass")
+def _():
+    from magepilot import updater as upd
+    now = 1_000_000.0
+    day = config.UPDATE_CHECK_INTERVAL_S
+    assert_true(upd._should_check({}, now), "no state → check")
+    assert_true(upd._should_check({"last_check_ts": now - day - 1}, now))
+    assert_true(not upd._should_check({"last_check_ts": now - 60}, now))
+    assert_true(upd._should_check({"last_check_ts": now + day * 9}, now),
+                "a future timestamp (clock skew) must not block checks forever")
+    assert_true(upd._should_check({"last_check_ts": now - 60, "staged_version": "v9"}, now),
+                "a staged update bypasses the 24h throttle")
+    assert_true(upd._should_check({"last_check_ts": "corrupt"}, now))
+
+
+@test("updater hook: MAGEPILOT_NO_AUTO_UPDATE / auto_update off / mcp-serve → no spawn")
+def _():
+    upd, spawned, emitted, restore = _hook_sandbox()
+    try:
+        os.environ["MAGEPILOT_NO_AUTO_UPDATE"] = "1"
+        upd.launch_hook(["runs"])
+        del os.environ["MAGEPILOT_NO_AUTO_UPDATE"]
+        assert_true(not spawned, "env kill-switch must disable everything")
+
+        upd._auto_update_enabled = lambda: False
+        upd.launch_hook(["runs"])
+        assert_true(not spawned, "auto_update=false must not spawn")
+        upd._auto_update_enabled = lambda: True
+
+        upd.launch_hook(["mcp-serve"])
+        assert_true(not spawned and not emitted, "mcp-serve is stdio JSON-RPC — total silence")
+
+        upd._is_managed_install = lambda root: False
+        upd.launch_hook(["runs"])
+        assert_true(not spawned, "dev checkouts never auto-update")
+    finally:
+        restore()
+
+
+@test("updater hook: applied-update notice prints once, then clears")
+def _():
+    from magepilot.updater import state as upd_state
+    upd, spawned, emitted, restore = _hook_sandbox()
+    try:
+        upd_state.write({"notify": True, "last_check_ts": time.time(),
+                         "last_result": {"ok": True, "new": "v0.3.0",
+                                         "url": "https://github.com/x/releases/tag/v0.3.0"}})
+        upd.launch_hook(["runs"])
+        assert_true(len(emitted) == 1)
+        assert_in("v0.3.0", emitted[0])
+        assert_in("releases/tag/v0.3.0", emitted[0])
+        upd.launch_hook(["runs"])
+        assert_true(len(emitted) == 1, "the notice prints exactly once")
+    finally:
+        restore()
+
+
+@test("updater hook: adds <50ms to launch")
+def _():
+    from magepilot.updater import state as upd_state
+    upd, spawned, emitted, restore = _hook_sandbox()
+    try:
+        upd_state.write({"last_check_ts": time.time()})    # steady state: nothing to do
+        samples = []
+        for _i in range(5):
+            t0 = time.perf_counter()
+            upd.launch_hook(["runs"])
+            samples.append(time.perf_counter() - t0)
+        samples.sort()
+        assert_true(samples[2] < 0.050, f"hook median {samples[2]*1000:.1f}ms ≥ 50ms")
+    finally:
+        restore()
+
+
 def main() -> int:
     passed = failed = 0
     print(f"running {len(_results)} deterministic tests (no model)\n")
