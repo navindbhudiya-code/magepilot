@@ -15,8 +15,10 @@ VENV="$ROOT/mlx-env"
 RUNDIR="$ROOT/.magepilot"
 LOGDIR="$ROOT/logs"
 # Prefer a locally-built model (no download) if present; else pull from HuggingFace once.
+# Newest local fuse wins (v5 = the iter-640 val-minimum retrain, 2026-06-12).
 _DEFAULT_MODEL="navindbhudiya/qwen2.5-coder-7b-magento-v2"
 [ -f "$ROOT/models/qwen2.5-coder-7b-magento-v4/config.json" ] && _DEFAULT_MODEL="$ROOT/models/qwen2.5-coder-7b-magento-v4"
+[ -f "$ROOT/models/qwen2.5-coder-7b-magento-v5/config.json" ] && _DEFAULT_MODEL="$ROOT/models/qwen2.5-coder-7b-magento-v5"
 MODEL="${MAGEPILOT_MODEL:-$_DEFAULT_MODEL}"
 MODEL_PORT=8080
 RAG_PORT=8090
