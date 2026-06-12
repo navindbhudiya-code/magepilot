@@ -5,11 +5,15 @@ import os
 import re
 import urllib.error
 
+from magepilot import config
+from magepilot.edits import facts, validate
 from magepilot.edits.apply import _reverse_for, _save_journal, apply as _apply_op, preview
 from magepilot.edits.blocks import parse_plan
 from magepilot.errors import ToolError
 from magepilot.llm.router import get_router
-from magepilot.safety import scan as safety_scan
+from magepilot.magento import archetypes
+from magepilot.magento.archetypes import _extract   # noqa: F401  (moved there; re-exported)
+from magepilot.safety import scan as safety_scan, xmlfix
 from magepilot.safety.sandbox import _resolve_file
 from magepilot.ui.progress import Spinner
 
@@ -23,31 +27,15 @@ SYSTEM = (
     "Rules: modern, idiomatic Magento 2 + Hyvä. Use standard paths "
     "(app/code/Vendor/Module/..., app/design/frontend/Vendor/Theme/...). Include EVERY file the task "
     "needs (registration.php, etc.). Put complete contents in @@CREATE.\n"
-    "A Hyvä theme needs only registration.php and theme.xml — it inherits Tailwind + Alpine from its "
-    "parent. Hyvä uses TAILWIND, never Less: do NOT create .less files.\n"
+    "A Hyvä theme needs registration.php, theme.xml (with <parent>Hyva/default</parent>) and "
+    "composer.json — it inherits Tailwind + Alpine from its parent. Hyvä uses TAILWIND, never Less: "
+    "do NOT create .less files.\n"
     "Do NOT wrap anything in ``` markdown fences. End every block with @@END and write NOTHING after the "
     "final @@END.\n"
     "When the user wants to change an EXISTING file whose current content is shown above, use @@EDIT and "
     "copy the EXACT existing text into @@FIND (verbatim, enough to be unique) and the new text into "
     "@@REPLACE. Prefer @@EDIT over @@CREATE for files that already exist."
 )
-
-
-def _extract(task: str):
-    """Best-effort pull of (vendor, name) from a request so we don't ask when they're already given."""
-    vendor = name = None
-    m = re.search(r"\b([A-Z][A-Za-z0-9]+)[\\_]([A-Z][A-Za-z0-9]+)\b", task)   # Vendor_Module / Vendor\Module
-    if m:
-        vendor, name = m.group(1), m.group(2)
-    if not vendor:
-        m = re.search(r"\bvendor[\s:_]+([A-Za-z][A-Za-z0-9]+)", task, re.I)
-        if m:
-            vendor = m.group(1)
-    if not name:
-        m = re.search(r"\b(?:name|named|called)[\s:]+([A-Za-z][A-Za-z0-9]+)", task, re.I)
-        if m:
-            name = m.group(1)
-    return vendor, name
 
 
 def clarify(task: str, asker) -> str:
@@ -88,18 +76,111 @@ def _context(task: str, root: str) -> str:
     return "\n\n".join(blocks)
 
 
+def _complete_coder(messages: list[dict]) -> str:
+    """The single coder-role call — manifest re-prompts and repair rounds go through
+    here too, so tests have ONE monkeypatch point. max_tokens is raised above the
+    global default: a complete multi-file plan (4+ files) doesn't fit in 900 tokens,
+    which used to silently truncate plans into 'missing companion file' failures."""
+    return get_router().complete("coder", messages, stop=["<|im_end|>"],
+                                 sampling={"max_tokens": 2400})
+
+
 def generate_plan(task: str, root: str) -> list[dict]:
     ctx = _context(task, root)
-    user = f"{ctx}\n\n{task}" if ctx else task
+    fact = facts.fact_block(task, root)
+    user = "\n\n".join(x for x in (fact, ctx, task) if x)
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
     try:
         with Spinner("planning changes"):
-            text = get_router().complete("coder", messages, stop=["<|im_end|>"])
+            text = _complete_coder(messages)
     except (urllib.error.URLError, OSError) as e:
-        from magepilot import config
         print(f"⚠ can't reach the model server at {config.MODEL_SERVER} — run `magepilot serve` first.\n   ({e})")
         return []
     return parse_plan(text.split("<|im_end|>")[0])
+
+
+def render_ops(ops: list[dict], max_chars: int = 8000) -> str:
+    """Ops back to @@-block text — the 'what you already generated' context for
+    manifest re-prompts and repair rounds."""
+    blocks = []
+    for op in ops:
+        if op["op"] == "create":
+            blocks.append(f"@@CREATE {op['path']}\n{op.get('content', '')}\n@@END")
+        elif op["op"] == "edit":
+            blocks.append(f"@@EDIT {op['path']}\n@@FIND\n{op.get('find', '')}\n"
+                          f"@@REPLACE\n{op.get('replace', '')}\n@@END")
+        elif op["op"] == "mkdir":
+            blocks.append(f"@@MKDIR {op['path']}\n@@END")
+        elif op["op"] == "delete":
+            blocks.append(f"@@DELETE {op['path']}\n@@END")
+    return "\n\n".join(blocks)[:max_chars]
+
+
+def complete_manifest(task: str, root: str, ops: list[dict]) -> tuple[list[dict], list[str]]:
+    """Rail 1 — the plan may not stop while archetype-required files are missing.
+
+    For EACH missing manifest file the coder is re-prompted individually (with the
+    already-generated ops as context so names/paths line up), max config.MANIFEST_RETRIES
+    times; what's still missing after that is returned as human-readable gaps."""
+    arch = archetypes.detect(task)
+    if arch is None or not ops:
+        return ops, []
+    gaps = []
+    for req in archetypes.manifest_gaps(arch, ops, root):
+        if req not in archetypes.manifest_gaps(arch, ops, root):
+            continue            # an earlier re-prompt already emitted this file too
+        params = archetypes.params_for(arch, ops, task)
+        rx = re.compile(req.path_re)
+        got = False
+        for _ in range(config.MANIFEST_RETRIES):
+            messages = [
+                {"role": "system", "content": SYSTEM},
+                {"role": "user", "content": task},
+                {"role": "assistant", "content": render_ops(ops)},
+                {"role": "user", "content":
+                    req.prompt.format(**params) +
+                    "\nEmit ONLY that one @@ block, matching the paths and class names "
+                    "already shown. Write NOTHING after @@END."},
+            ]
+            try:
+                with Spinner(f"completing the file set ({req.kind})"):
+                    text = _complete_coder(messages)
+            except (urllib.error.URLError, OSError):
+                break
+            new = [o for o in parse_plan(text.split("<|im_end|>")[0])
+                   if rx.search("/" + (o.get("path") or "").replace("\\", "/").lstrip("/"))
+                   and o["path"] not in {x["path"] for x in ops}]
+            if new:
+                ops = ops + new
+                got = True
+                break
+        if not got:
+            gaps.append(f"{req.kind} (a {arch.name} needs it; the model never produced it)")
+    return ops, gaps
+
+
+def repair_plan(task: str, root: str, ops: list[dict], issues: list) -> list[dict]:
+    """One repair round: quote each EXACT validation error back to the coder and swap in
+    the re-emitted files. Ops that aren't failing are never touched."""
+    failing = {i.path for i in issues}
+    err_text = "\n".join(f"{i.path}: {i.detail}" for i in issues)
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": task},
+        {"role": "assistant", "content": render_ops(ops)},
+        {"role": "user", "content":
+            "These files failed validation:\n" + err_text +
+            "\nRe-emit ONLY the failing file(s) as corrected @@CREATE blocks "
+            "(complete content). Write NOTHING after the final @@END."},
+    ]
+    try:
+        with Spinner("repairing invalid files"):
+            text = _complete_coder(messages)
+    except (urllib.error.URLError, OSError):
+        return ops
+    fixed = {o["path"]: o for o in parse_plan(text.split("<|im_end|>")[0])
+             if o.get("op") == "create" and o.get("path") in failing and o.get("content")}
+    return [fixed.get(op.get("path"), op) for op in ops]
 
 
 def run_make(task: str, root: str, approver=None, asker=None,
@@ -114,15 +195,38 @@ def run_make(task: str, root: str, approver=None, asker=None,
     ops = generate_plan(task, root)
     if not ops:
         print("No file changes were produced. Try rephrasing, or ask it as a question instead.")
-        return {"applied": [], "skipped": []}
+        return {"applied": [], "skipped": [], "gaps": [], "failed_validation": []}
 
-    print(f"\nProposed {len(ops)} change(s) in {root}:\n")
+    # --- deterministic rails: manifest → XML auto-fix → validate→repair → plan lint ---
+    ops, gaps = complete_manifest(task, root, ops)
+    fix_notes = xmlfix.autofix_ops(ops)
+    issues = validate.validate_ops(root, ops)
+    rounds = 0
+    while issues and rounds < config.REPAIR_ROUNDS:
+        ops = repair_plan(task, root, ops, issues)
+        fix_notes += xmlfix.autofix_ops(ops)        # repaired content may regress the XML
+        issues = validate.validate_ops(root, ops)
+        rounds += 1
+    plan_findings = safety_scan.scan_plan(ops, root)
+    print("\n" + validate.verdict(ops, issues, gaps, plan_findings, fix_notes) + "\n")
+    failed_validation = [{"path": i.path, "error": i.detail} for i in issues]
+    still_bad = {i.path for i in issues}
+
+    print(f"Proposed {len(ops)} change(s) in {root}:\n")
     applied, skipped, blocked_ops, reverses = [], [], [], []
     approve_all = auto
     for op in ops:
         # pre-write scan BEFORE the approval prompt — findings appear with the preview;
-        # BLOCK-tier findings refuse the op even in full-auto mode
-        findings = safety_scan.scan_op(op)
+        # BLOCK-tier findings refuse the op even in full-auto mode. Cross-file findings
+        # (MP016/MP017) land on their op here so they ride the same refusal path.
+        findings = safety_scan.scan_op(op) \
+            + [f for f in plan_findings if f.path == op.get("path")]
+        if op.get("path") in still_bad:
+            print(preview(root, op))
+            err = next(i.detail for i in issues if i.path == op["path"])
+            print(f"   ↳ ⛔ failed validation after {rounds} repair round(s): {err}\n")
+            skipped.append(op)
+            continue
         print(preview(root, op))
         for f in findings:
             print("   " + f.render())
@@ -179,4 +283,10 @@ def run_make(task: str, root: str, approver=None, asker=None,
                         print(f"   (exit {res['exit']})\n{out}")
                     else:
                         print(f"   skipped — {res['reason']}")
-    return {"applied": applied, "skipped": skipped, "blocked": blocked_ops}
+    if gaps:
+        print("⚠ The plan is INCOMPLETE — the model never produced these required files:")
+        for g in gaps:
+            print(f"   • {g}")
+        print("  Create them manually or re-run with a more explicit task.\n")
+    return {"applied": applied, "skipped": skipped, "blocked": blocked_ops,
+            "gaps": gaps, "failed_validation": failed_validation}

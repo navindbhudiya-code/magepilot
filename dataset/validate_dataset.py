@@ -84,9 +84,10 @@ def check_shape(path, i, obj):
     roles = [m.get("role") for m in msgs]
     if "user" not in roles or "assistant" not in roles:
         errors.append(f"{path}:{i} needs both a user and an assistant turn")
-    # chat-format hygiene: should open on user and close on assistant
-    if roles and (roles[0] != "user" or roles[-1] != "assistant"):
-        warns.append(f"{path}:{i} role order is {roles} (expected user...assistant)")
+    # chat-format hygiene: [user, assistant] or [system, user, assistant]
+    if roles not in (["user", "assistant"], ["system", "user", "assistant"]):
+        warns.append(f"{path}:{i} role order is {roles} "
+                     "(expected user..assistant or system,user,assistant)")
     user = next((m["content"] for m in msgs if m.get("role") == "user"), "")
     asst = next((m["content"] for m in msgs if m.get("role") == "assistant"), "")
     if not user.strip() or not asst.strip():
@@ -113,6 +114,43 @@ def norm(s):
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
+# ---- token counting: the REAL tokenizer + chat template when available -------------
+# Training truncates at max_seq_length; a silently truncated example teaches a cut-off
+# answer. Count with the actual Qwen2.5 tokenizer applying the chat template (what
+# mlx_lm.lora trains on); fall back to the chars/3.5 estimate only when transformers
+# isn't importable — loudly.
+_TOKENIZER = None
+_TOKENIZER_ERR = ""
+
+
+def _get_tokenizer():
+    global _TOKENIZER, _TOKENIZER_ERR
+    if _TOKENIZER is not None or _TOKENIZER_ERR:
+        return _TOKENIZER
+    try:
+        from transformers import AutoTokenizer
+        _TOKENIZER = AutoTokenizer.from_pretrained(
+            "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit", local_files_only=True)
+    except Exception as e:           # model not cached / transformers missing
+        try:
+            from transformers import AutoTokenizer
+            _TOKENIZER = AutoTokenizer.from_pretrained(
+                "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit")
+        except Exception as e2:
+            _TOKENIZER_ERR = str(e2) or str(e)
+    return _TOKENIZER
+
+
+def count_tokens(messages) -> tuple:
+    """(token_count, exact: bool) for one example, chat template applied."""
+    tok = _get_tokenizer()
+    if tok is not None:
+        ids = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+        return len(ids), True
+    full = "\n".join(m.get("content", "") for m in messages)
+    return int(len(full) / CHARS_PER_TOKEN), False
+
+
 def main():
     if not FORBIDDEN:
         errors.append(
@@ -133,11 +171,15 @@ def main():
                 continue
             scan_leaks(path, i, user)
             scan_leaks(path, i, asst)
-            full = user + "\n" + asst
-            est_tokens = int(len(full) / CHARS_PER_TOKEN)
-            if est_tokens > MAX_SEQ_LEN:
+            n_tokens, exact = count_tokens(obj["messages"])
+            if n_tokens > MAX_SEQ_LEN:
                 over_len += 1
-                warns.append(f"{path}:{i} ~{est_tokens} tokens > max_seq_len {MAX_SEQ_LEN} (will be truncated)")
+                if exact:
+                    errors.append(f"{path}:{i} {n_tokens} tokens > max_seq_len {MAX_SEQ_LEN} "
+                                  "(would be silently truncated in training)")
+                else:
+                    warns.append(f"{path}:{i} ~{n_tokens} tokens (ESTIMATE) > max_seq_len "
+                                 f"{MAX_SEQ_LEN}")
             key = norm(user)
             all_seen[key] += 1
             if path == "train.jsonl":
@@ -149,7 +191,10 @@ def main():
     for k, c in list(dupes.items())[:20]:
         warns.append(f"duplicate instruction x{c}: {k[:60]}")
 
+    tok_mode = ("EXACT (Qwen2.5 tokenizer + chat template)" if _get_tokenizer() is not None
+                else f"ESTIMATE chars/{CHARS_PER_TOKEN} — transformers unavailable: {_TOKENIZER_ERR}")
     print(f"\n=== DATASET VALIDATION: {DATA_DIR}/ ===")
+    print(f"token counting : {tok_mode}")
     print(f"denylist terms : {len(FORBIDDEN)} (from {os.path.basename(FORBIDDEN_PATH)})")
     print(f"train examples : {len(train)}")
     print(f"valid examples : {len(valid)}")
