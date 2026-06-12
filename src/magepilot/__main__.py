@@ -4,6 +4,8 @@ import sys
 
 
 def main() -> int:
+    from magepilot.updater import launch_hook
+    launch_hook(sys.argv[1:])
     if len(sys.argv) <= 1:
         from magepilot.ui.repl import main as repl_main
         return repl_main()

@@ -81,6 +81,17 @@ def _indent(text: str, pad: str = "        ") -> str:
     return "\n".join(pad + ln for ln in (text or "(no output)").splitlines()[:40])
 
 
+class _VersionAction(argparse.Action):
+    """Lazy --version: `git describe` runs only when actually asked."""
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        from magepilot.updater.check import local_version
+        print(f"magepilot {local_version(config.REPO_ROOT)}")
+        parser.exit(0)
+
+
 def _attach_mcp(root: str) -> None:
     """Spawn the user's configured MCP servers (config.toml [mcp_servers.*]) and add
     their tools to the registry. No servers configured → no-op; failures warn only."""
@@ -120,6 +131,8 @@ def _drive(run, *, auto: bool, quiet: bool) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="magepilot", description="Magepilot — AI agent for Magento 2")
+    ap.add_argument("--version", "-V", action=_VersionAction,
+                    help="print the magepilot version and exit")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_idx = sub.add_parser("index", help="build/refresh the codebase index")
@@ -194,7 +207,15 @@ def main(argv=None) -> int:
     p_mcp.add_argument("--allow-writes", action="store_true",
                        help="also expose write tools (auto-approved — the MCP client gates them)")
 
+    p_upd = sub.add_parser("update", help="check for / apply a Magepilot update now")
+    p_upd.add_argument("--check", action="store_true",
+                       help="dry run — report current vs latest, change nothing")
+
     args = ap.parse_args(argv)
+
+    if args.cmd == "update":
+        from magepilot.updater import run_update
+        return run_update(check_only=args.check)
 
     if args.cmd == "index":
         root = _abs_root(args.root) or config.DEFAULT_CODEBASE

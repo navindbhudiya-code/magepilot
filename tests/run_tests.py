@@ -2376,19 +2376,37 @@ def _():
     assert_true(not upd_check.is_newer("v0.3.0", "garbage"))
 
 
-@test("updater check: stable channel uses the GitHub release tag; offline is silent")
+@test("updater check: stable uses the release API, falls back to remote tags, offline silent")
 def _():
     from magepilot.updater import check as upd_check
     orig_http, orig_git = upd_check._http_get, upd_check._git
+
+    def fake_git(root, *a, **k):
+        if a[:1] == ("describe",):
+            return 0, "v0.2.0"
+        if a[:2] == ("ls-remote", "--tags"):
+            return 0, ("aaa\trefs/tags/v0.3.0\n"
+                       "bbb\trefs/tags/v0.10.0\n"
+                       "ccc\trefs/tags/not-a-version")
+        return 1, ""
+
     upd_check._http_get = lambda url, timeout=3.0: (
         b'{"tag_name": "v0.9.0", "html_url": "https://github.com/x/y/releases/tag/v0.9.0"}')
-    upd_check._git = lambda root, *a, **k: (0, "v0.2.0")        # local describe
+    upd_check._git = fake_git
     try:
         res = upd_check.check("/nonexistent", channel="stable")
         assert_true(res["update_available"] is True)
         assert_true(res["latest"] == "v0.9.0" and res["local"] == "v0.2.0")
         assert_in("releases/tag/v0.9.0", res["url"])
-        upd_check._http_get = lambda url, timeout=3.0: None     # offline / rate-limited
+
+        upd_check._http_get = lambda url, timeout=3.0: None     # API 404 / rate-limited
+        res = upd_check.check("/nonexistent", channel="stable")
+        assert_true(res["latest"] == "v0.10.0",
+                    "no Release objects → newest remote TAG, in semver (not string) order")
+        assert_true(res["update_available"] is True)
+
+        upd_check._git = lambda root, *a, **k: ((0, "v0.2.0") if a[:1] == ("describe",)
+                                                else (1, ""))   # fully offline
         res = upd_check.check("/nonexistent", channel="stable")
         assert_true(res["update_available"] is False and res["latest"] is None,
                     "any network failure must be silent, never raised")

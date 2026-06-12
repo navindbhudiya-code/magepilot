@@ -77,6 +77,19 @@ def latest_release(timeout: float = HTTP_TIMEOUT) -> tuple:
     return tag, url
 
 
+def _remote_tags(root: str, timeout: int = 10) -> list[str]:
+    """vX.Y.Z tags on origin via ls-remote — no API, no auth, no rate limit."""
+    rc, out = _git(root, "ls-remote", "--tags", "--refs", "origin", timeout=timeout)
+    if rc != 0:
+        return []
+    tags = []
+    for line in out.splitlines():
+        tag = line.split("\t")[-1].rsplit("/", 1)[-1].strip()
+        if parse_version(tag):
+            tags.append(tag)
+    return sorted(tags, key=parse_version)
+
+
 def check(root: str, channel: str = "stable", timeout: float = HTTP_TIMEOUT) -> dict:
     """{'local', 'latest', 'url', 'update_available'} — never raises."""
     local = local_version(root)
@@ -89,5 +102,12 @@ def check(root: str, channel: str = "stable", timeout: float = HTTP_TIMEOUT) -> 
                 "url": f"https://github.com/{config.UPDATE_REPO_SLUG}/commits/main",
                 "update_available": available}
     tag, url = latest_release(timeout)
+    if not tag:
+        # The project publishes plain git tags, not GitHub Release objects → the
+        # releases API is 404. Fall back to the newest remote tag.
+        tags = _remote_tags(root)
+        if tags:
+            tag = tags[-1]
+            url = f"https://github.com/{config.UPDATE_REPO_SLUG}/releases/tag/{tag}"
     return {"local": local, "latest": tag, "url": url,
             "update_available": is_newer(tag, local)}
