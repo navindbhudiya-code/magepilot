@@ -213,6 +213,14 @@ def main() -> int:
         print(f"model server {config.MODEL_SERVER} is {model} — run `./magepilot serve` first")
         return 1
     print(f"eval '{args.label}' against: {model}\n")
+    if "magento" not in model.lower():
+        # mlx_lm.server maps --adapter-path ONLY onto the request-model name
+        # "default_model"; named-model requests (which the router sends) silently get
+        # the BASE weights. Adapter-served evals therefore score the base model —
+        # fuse the adapter and serve the fused path instead.
+        print("⚠ WARNING: only the base model id is served — if you meant to eval an "
+              "adapter via --adapter-path, this run is scoring the BASE model. "
+              "Fuse first (mlx_lm.fuse) and serve the fused path.\n")
 
     raw_dir = os.path.join(HERE, "reports", "raw", args.label)
     os.makedirs(raw_dir, exist_ok=True)
