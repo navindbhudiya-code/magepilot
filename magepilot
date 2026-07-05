@@ -49,9 +49,40 @@ up() { curl -s -m 3 "http://127.0.0.1:$1/v1/models" >/dev/null 2>&1; }
 is_apple_silicon() { [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; }
 
 # ----------------------------------------------------------------------------- install
+# The Python the env is built with. 3.14 has no wheels for parts of the ML stack yet,
+# and an x86_64 (Rosetta) interpreter can NEVER run MLX on Apple Silicon — so we pin the
+# version and, on Apple Silicon, request the native arm64 build explicitly (a Rosetta-
+# installed uv would otherwise silently fetch x86_64 CPython). Override: MAGEPILOT_PYTHON.
+PY_VERSION="${MAGEPILOT_PYTHON:-3.12}"
+_python_request() {
+  if is_apple_silicon; then echo "cpython-${PY_VERSION}-macos-aarch64"; else echo "$PY_VERSION"; fi
+}
+
+_venv_ok() {
+  [ -x "$VENV/bin/python" ] || return 1
+  "$VENV/bin/python" -c 'import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) else 1)' \
+    || return 1
+  # host truth comes from bash — a Rosetta python lies about the machine
+  if is_apple_silicon; then
+    [ "$("$VENV/bin/python" -c 'import platform; print(platform.machine())')" = "arm64" ] || return 1
+  fi
+}
+
 cmd_install() {
   command -v uv >/dev/null 2>&1 || die "uv not found — install it first:  brew install uv"
-  [ -d "$VENV" ] || { info "creating Python environment (mlx-env)…"; uv venv "$VENV"; }
+  if [ -d "$VENV" ] && ! _venv_ok; then
+    warn "existing mlx-env has an unsupported Python ($("$VENV/bin/python" -V 2>&1) $("$VENV/bin/python" -c 'import platform;print(platform.machine())' 2>/dev/null)) — recreating it…"
+    rm -rf "$VENV"
+  fi
+  [ -d "$VENV" ] || { info "creating Python environment (mlx-env, Python ${PY_VERSION})…"
+                      uv venv --python "$(_python_request)" "$VENV"; }
+  if is_apple_silicon; then
+    arch="$("$VENV/bin/python" -c 'import platform;print(platform.machine())')"
+    [ "$arch" = "arm64" ] || die "mlx-env's Python is ${arch}, not arm64 — your uv/terminal is running under Rosetta.
+   MLX needs a native arm64 Python. Fix: install native uv (from /opt/homebrew: brew install uv,
+   or: curl -LsSf https://astral.sh/uv/install.sh | sh), open a NON-Rosetta terminal,
+   then re-run:  rm -rf $VENV && ./magepilot install"
+  fi
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
   # 'protobuf<7' is REQUIRED: mlx-lm pulls protobuf 7.x, which makes the resolver drop
